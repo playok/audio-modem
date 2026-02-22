@@ -3,12 +3,73 @@
 let ws = null;
 let currentMode = 'send';
 let selectedFile = null;
+let audioDevices = { hasInput: false, hasOutput: false, devices: [] };
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
     connectWebSocket();
     setupDragDrop();
+    checkAudioDevices();
 });
+
+// Audio Device Check
+async function checkAudioDevices() {
+    try {
+        const res = await fetch('/api/devices');
+        const data = await res.json();
+
+        if (data.status === 'ok') {
+            audioDevices = data;
+
+            const warnings = [];
+            if (!data.hasOutput) warnings.push('출력 장치 없음 (전송 불가)');
+            if (!data.hasInput) warnings.push('입력 장치 없음 (수신 불가)');
+
+            if (warnings.length > 0) {
+                showDeviceWarning(warnings);
+                addLog('warn', `오디오 장치: ${warnings.join(', ')}`);
+            } else {
+                addLog('info', `오디오 장치 준비 완료 (입력: ✓, 출력: ✓)`);
+            }
+
+            if (data.devices) {
+                data.devices.forEach(d => {
+                    const def = d.IsDefault ? ' [기본]' : '';
+                    addLog('info', `  장치: ${d.Name} (입력:${d.MaxInputChannels} 출력:${d.MaxOutputChannels})${def}`);
+                });
+            }
+
+            updateButtonStates();
+        }
+    } catch (err) {
+        addLog('error', '오디오 장치 정보를 가져올 수 없습니다');
+    }
+}
+
+function showDeviceWarning(warnings) {
+    const banner = document.getElementById('device-warning');
+    if (banner) {
+        banner.style.display = 'block';
+        banner.innerHTML = warnings.map(w =>
+            `<div class="warning-item">⚠ ${w}</div>`
+        ).join('');
+    }
+}
+
+function updateButtonStates() {
+    const sendBtn = document.getElementById('btn-send');
+    const recvBtn = document.getElementById('btn-receive');
+
+    if (sendBtn && !audioDevices.hasOutput) {
+        sendBtn.disabled = true;
+        sendBtn.title = '출력 장치가 없어 전송할 수 없습니다';
+    }
+
+    if (recvBtn && !audioDevices.hasInput) {
+        recvBtn.disabled = true;
+        recvBtn.title = '입력 장치가 없어 수신할 수 없습니다';
+    }
+}
 
 // WebSocket Connection
 function connectWebSocket() {
@@ -65,7 +126,7 @@ function handleFileSelect(event) {
     selectedFile = file;
     const info = document.getElementById('file-info');
     info.textContent = `${file.name} (${formatSize(file.size)})`;
-    document.getElementById('btn-send').disabled = false;
+    document.getElementById('btn-send').disabled = !audioDevices.hasOutput;
     addLog('info', `파일 선택: ${file.name} (${formatSize(file.size)})`);
 }
 
@@ -89,7 +150,7 @@ function setupDragDrop() {
         if (file) {
             selectedFile = file;
             document.getElementById('file-info').textContent = `${file.name} (${formatSize(file.size)})`;
-            document.getElementById('btn-send').disabled = false;
+            document.getElementById('btn-send').disabled = !audioDevices.hasOutput;
             addLog('info', `파일 선택: ${file.name} (${formatSize(file.size)})`);
         }
     });
@@ -98,6 +159,11 @@ function setupDragDrop() {
 // Send
 async function startSend() {
     if (!selectedFile) return;
+
+    if (!audioDevices.hasOutput) {
+        addLog('error', '출력 장치가 없어 전송할 수 없습니다. 시스템 사운드 설정을 확인하세요.');
+        return;
+    }
 
     const btn = document.getElementById('btn-send');
     btn.disabled = true;
@@ -133,6 +199,11 @@ async function startSend() {
 
 // Receive
 async function startReceive() {
+    if (!audioDevices.hasInput) {
+        addLog('error', '입력 장치가 없어 수신할 수 없습니다. 시스템 사운드 설정에서 기본 입력 장치를 설정하세요.');
+        return;
+    }
+
     const btn = document.getElementById('btn-receive');
     btn.disabled = true;
     btn.textContent = '수신 대기 중...';
@@ -208,11 +279,11 @@ function resetButtons() {
     const sendBtn = document.getElementById('btn-send');
     const recvBtn = document.getElementById('btn-receive');
     if (sendBtn) {
-        sendBtn.disabled = !selectedFile;
+        sendBtn.disabled = !selectedFile || !audioDevices.hasOutput;
         sendBtn.textContent = '전송 시작';
     }
     if (recvBtn) {
-        recvBtn.disabled = false;
+        recvBtn.disabled = !audioDevices.hasInput;
         recvBtn.textContent = '수신 대기';
     }
 }

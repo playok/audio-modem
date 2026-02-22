@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "localhost:8080", "Server address")
+	addr := flag.String("addr", "0.0.0.0:8080", "Server address")
 	uploadDir := flag.String("upload-dir", "./uploads", "Upload directory")
 	receiveDir := flag.String("receive-dir", "./received", "Receive directory")
 	listDevices := flag.Bool("list-devices", false, "List audio devices and exit")

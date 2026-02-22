@@ -16,6 +16,7 @@ type SessionMode int
 const (
 	ModeSend    SessionMode = iota
 	ModeReceive
+	ModeDuplex
 )
 
 // SessionStatus represents the session state.
@@ -66,16 +67,18 @@ type Session struct {
 	rsEncoder   *fec.RSEncoder
 	transport   *Transport
 	modulation  modem.Modulation
+	mode        SessionMode
 
 	status    SessionStatus
 	eventChan chan SessionEvent
 
-	// preamble generator for frame transmission
 	preambleGen *modem.PreambleGenerator
+	hasInput    bool
+	hasOutput   bool
 }
 
 // NewSession creates a new communication session.
-func NewSession(mod modem.Modulation) (*Session, error) {
+func NewSession(mod modem.Modulation, mode SessionMode) (*Session, error) {
 	rsEnc, err := fec.NewRSEncoder()
 	if err != nil {
 		return nil, fmt.Errorf("create RS encoder: %w", err)
@@ -87,23 +90,59 @@ func NewSession(mod modem.Modulation) (*Session, error) {
 		demodulator: modem.NewDemodulator(mod),
 		rsEncoder:   rsEnc,
 		modulation:  mod,
+		mode:        mode,
 		eventChan:   make(chan SessionEvent, 100),
 		preambleGen: modem.NewPreambleGenerator(42),
 	}
 
-	// Create transport with sender/receiver callbacks
 	s.transport = NewTransport(s.sendFrame, s.receiveFrame)
 
 	return s, nil
 }
 
-// Open initializes the audio I/O.
+// Open initializes the audio I/O based on the session mode.
 func (s *Session) Open() error {
 	s.setStatus(StatusConnecting, "Opening audio devices...")
 
-	if err := s.audioIO.OpenDuplex(); err != nil {
-		s.setStatus(StatusError, fmt.Sprintf("Audio open failed: %v", err))
-		return err
+	switch s.mode {
+	case ModeSend:
+		// Send mode: need output (required) + input (optional, for ACK)
+		if err := s.audioIO.OpenOutput(); err != nil {
+			s.setStatus(StatusError, fmt.Sprintf("Audio output open failed: %v", err))
+			return err
+		}
+		s.hasOutput = true
+
+		if err := s.audioIO.OpenInput(); err != nil {
+			log.Printf("Warning: No input device available. ACK reception disabled: %v", err)
+			s.hasInput = false
+		} else {
+			s.hasInput = true
+		}
+
+	case ModeReceive:
+		// Receive mode: need input (required) + output (optional, for ACK)
+		if err := s.audioIO.OpenInput(); err != nil {
+			s.setStatus(StatusError, fmt.Sprintf("Audio input open failed: %v", err))
+			return err
+		}
+		s.hasInput = true
+
+		if err := s.audioIO.OpenOutput(); err != nil {
+			log.Printf("Warning: No output device available. ACK sending disabled: %v", err)
+			s.hasOutput = false
+		} else {
+			s.hasOutput = true
+		}
+
+	case ModeDuplex:
+		// Need both
+		if err := s.audioIO.OpenDuplex(); err != nil {
+			s.setStatus(StatusError, fmt.Sprintf("Audio open failed: %v", err))
+			return err
+		}
+		s.hasInput = true
+		s.hasOutput = true
 	}
 
 	s.setStatus(StatusConnected, "Audio devices ready")
@@ -128,19 +167,18 @@ func (s *Session) Transport() *Transport {
 
 // sendFrame modulates and transmits a protocol frame.
 func (s *Session) sendFrame(frame *Frame) error {
-	// Encode frame to bytes
+	if !s.hasOutput {
+		return fmt.Errorf("no output device available")
+	}
+
 	frameBytes := frame.Encode()
 
-	// RS encode
 	encoded, err := s.rsEncoder.Encode(frameBytes)
 	if err != nil {
 		return fmt.Errorf("RS encode: %w", err)
 	}
 
-	// Generate OFDM signal
 	signal := modem.GenerateFrame(encoded, s.modulation)
-
-	// Convert to float32 and transmit
 	samples32 := modem.SamplesToFloat32(signal)
 
 	if err := s.audioIO.StartOutput(); err != nil {
@@ -153,15 +191,16 @@ func (s *Session) sendFrame(frame *Frame) error {
 
 // receiveFrame receives and demodulates a protocol frame.
 func (s *Session) receiveFrame(timeout time.Duration) (*Frame, error) {
+	if !s.hasInput {
+		return nil, fmt.Errorf("no input device available")
+	}
+
 	if err := s.audioIO.StartInput(); err != nil {
 		return nil, fmt.Errorf("start input: %w", err)
 	}
 	defer s.audioIO.StopInput()
 
-	// Calculate expected number of samples
-	// Preamble (2 symbols) + channel est (1 symbol) + at least 1 data symbol
 	minSamples := 4 * modem.SymbolLen
-	// Read extra samples for detection margin
 	totalSamples := minSamples + 10*modem.SymbolLen
 
 	deadline := time.Now().Add(timeout)
@@ -183,24 +222,20 @@ func (s *Session) receiveFrame(timeout time.Duration) (*Frame, error) {
 		return nil, fmt.Errorf("timeout: insufficient samples (%d < %d)", len(allSamples), minSamples)
 	}
 
-	// Apply DC removal and AGC
 	allSamples = modem.ApplyDCRemoval(allSamples)
 	allSamples = modem.ApplyAGC(allSamples, 0.3)
 
-	// Demodulate
 	bitsPerSym := modem.BitsPerOFDMSymbol(s.modulation)
 	data, err := modem.ReceiveFrame(allSamples, s.modulation, bitsPerSym)
 	if err != nil {
 		return nil, fmt.Errorf("demodulate: %w", err)
 	}
 
-	// RS decode
 	decoded, err := s.rsEncoder.Decode(data)
 	if err != nil {
 		return nil, fmt.Errorf("RS decode: %w", err)
 	}
 
-	// Parse frame
 	frame, err := DecodeFrame(decoded)
 	if err != nil {
 		return nil, fmt.Errorf("decode frame: %w", err)

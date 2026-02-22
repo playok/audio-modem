@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/jeongseonghan/audio-modem/internal/audio"
 	"github.com/jeongseonghan/audio-modem/internal/modem"
 	"github.com/jeongseonghan/audio-modem/internal/protocol"
 )
@@ -136,7 +137,7 @@ func (h *Handlers) HandleSend(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 
-		session, err := protocol.NewSession(mod)
+		session, err := protocol.NewSession(mod, protocol.ModeSend)
 		if err != nil {
 			h.wsHub.BroadcastStatus("error", fmt.Sprintf("Session create failed: %v", err))
 			return
@@ -203,7 +204,7 @@ func (h *Handlers) HandleReceiveStart(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 
-		session, err := protocol.NewSession(mod)
+		session, err := protocol.NewSession(mod, protocol.ModeReceive)
 		if err != nil {
 			h.wsHub.BroadcastStatus("error", fmt.Sprintf("Session create failed: %v", err))
 			return
@@ -262,10 +263,20 @@ func (h *Handlers) HandleStatus(w http.ResponseWriter, r *http.Request) {
 
 // HandleDevices lists available audio devices.
 func (h *Handlers) HandleDevices(w http.ResponseWriter, r *http.Request) {
-	// Import audio package for device listing
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "ok",
-		"note":   "Device listing requires PortAudio initialization",
+	devices, err := audio.ListDevices()
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"devices":   devices,
+		"hasInput":  audio.HasInputDevice(),
+		"hasOutput": audio.HasOutputDevice(),
 	})
 }
 

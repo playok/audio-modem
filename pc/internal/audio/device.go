@@ -22,18 +22,17 @@ func ListDevices() ([]DeviceInfo, error) {
 		return nil, fmt.Errorf("list devices: %w", err)
 	}
 
-	defaultIn, err := portaudio.DefaultInputDevice()
-	if err != nil {
-		return nil, fmt.Errorf("default input device: %w", err)
+	var defaultInName, defaultOutName string
+	if d, err := portaudio.DefaultInputDevice(); err == nil {
+		defaultInName = d.Name
 	}
-	defaultOut, err := portaudio.DefaultOutputDevice()
-	if err != nil {
-		return nil, fmt.Errorf("default output device: %w", err)
+	if d, err := portaudio.DefaultOutputDevice(); err == nil {
+		defaultOutName = d.Name
 	}
 
 	var result []DeviceInfo
 	for _, d := range devices {
-		isDefault := (d.Name == defaultIn.Name) || (d.Name == defaultOut.Name)
+		isDefault := (d.Name == defaultInName) || (d.Name == defaultOutName)
 		result = append(result, DeviceInfo{
 			Name:              d.Name,
 			MaxInputChannels:  d.MaxInputChannels,
@@ -45,6 +44,18 @@ func ListDevices() ([]DeviceInfo, error) {
 	return result, nil
 }
 
+// HasInputDevice returns true if a default input device is available.
+func HasInputDevice() bool {
+	_, err := portaudio.DefaultInputDevice()
+	return err == nil
+}
+
+// HasOutputDevice returns true if a default output device is available.
+func HasOutputDevice() bool {
+	_, err := portaudio.DefaultOutputDevice()
+	return err == nil
+}
+
 // PrintDevices prints all available audio devices.
 func PrintDevices() error {
 	devices, err := ListDevices()
@@ -52,6 +63,10 @@ func PrintDevices() error {
 		return err
 	}
 	fmt.Println("Audio Devices:")
+	if len(devices) == 0 {
+		fmt.Println("  (no devices found)")
+		return nil
+	}
 	for i, d := range devices {
 		defaultStr := ""
 		if d.IsDefault {
@@ -60,6 +75,13 @@ func PrintDevices() error {
 		fmt.Printf("  %d: %s (in:%d out:%d rate:%.0f)%s\n",
 			i, d.Name, d.MaxInputChannels, d.MaxOutputChannels,
 			d.DefaultSampleRate, defaultStr)
+	}
+
+	if !HasInputDevice() {
+		fmt.Println("\n  WARNING: No default input device. Receive mode unavailable.")
+	}
+	if !HasOutputDevice() {
+		fmt.Println("\n  WARNING: No default output device. Send mode unavailable.")
 	}
 	return nil
 }
