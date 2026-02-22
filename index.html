@@ -76,6 +76,23 @@
         .chunk-stats { display: flex; justify-content: space-between; font-size: 0.8rem; color: #aaa; margin-bottom: 8px; }
         #chunk-bitmap-canvas { width: 100%; height: 40px; background: #0f0f23; border-radius: 4px; border: 1px solid #2a2a4a; }
         #chunk-filename { margin-top: 6px; font-size: 0.85rem; color: #00d4ff; }
+
+        .test-buttons { display: flex; gap: 8px; margin-bottom: 12px; }
+        .test-btn { flex: 1; padding: 10px; border: 1px solid #2a2a4a; border-radius: 8px;
+            background: transparent; color: #aaa; cursor: pointer; font-size: 0.85rem; transition: all 0.2s; }
+        .test-btn:hover { border-color: #00d4ff; color: #e0e0e0; }
+        .test-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .test-result-box { margin-top: 10px; padding: 12px; border-radius: 8px;
+            background: rgba(0,212,255,0.05); border: 1px solid #2a2a4a; }
+        .quality-badge { display: inline-block; padding: 4px 12px; border-radius: 12px;
+            font-size: 0.8rem; font-weight: 600; }
+        .quality-excellent { background: rgba(0,255,136,0.15); color: #00ff88; }
+        .quality-good { background: rgba(255,170,0,0.15); color: #ffaa00; }
+        .quality-poor { background: rgba(255,68,68,0.15); color: #ff4444; }
+        #test-spectrum-canvas, #test-channel-canvas {
+            width: 100%; background: #0f0f23;
+            border-radius: 6px; border: 1px solid #2a2a4a; margin-top: 8px;
+        }
     </style>
 </head>
 <body>
@@ -127,6 +144,21 @@
                     </select>
                 </div>
                 <p id="modulation-info" style="margin-top:8px; font-size:0.8rem; color:#888; line-height:1.5"></p>
+            </div>
+
+            <div class="card" id="test-panel">
+                <h2>사전 테스트</h2>
+                <p style="color:#888; font-size:0.85rem; margin-bottom:12px">
+                    전송 전에 오디오 경로의 음량과 품질을 확인하세요.
+                </p>
+                <div class="test-buttons">
+                    <button class="test-btn" onclick="runOutputTest()">🔊 출력</button>
+                    <button class="test-btn" onclick="runInputTest()">🎙️ 입력</button>
+                    <button class="test-btn" onclick="runLoopbackTest()">🔄 루프백</button>
+                </div>
+                <canvas id="test-spectrum-canvas" height="100" style="display:none"></canvas>
+                <canvas id="test-channel-canvas" height="100" style="display:none"></canvas>
+                <div id="test-result" style="display:none"></div>
             </div>
 
             <div id="send-panel" class="card">

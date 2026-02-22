@@ -1303,3 +1303,395 @@ function drawWaveform() {
     ctx.moveTo(trimEndX, 0); ctx.lineTo(trimEndX, h);
     ctx.stroke();
 }
+
+// ============================================================
+// Pre-Test — Audio Path Diagnostics
+// ============================================================
+
+let testRunning = false;
+
+function setTestButtonsDisabled(disabled) {
+    document.querySelectorAll('.test-btn').forEach(btn => btn.disabled = disabled);
+}
+
+// --- Output Test ---
+async function runOutputTest() {
+    if (testRunning) return;
+    testRunning = true;
+    setTestButtonsDisabled(true);
+    hideTestResults();
+
+    const { config, modName, repetition } = getModemParams(modulation);
+    setOFDMConfig(config);
+
+    const ctx = getAudioContext();
+    addLog('info', '출력 테스트 시작 — 스윕 톤 재생');
+
+    try {
+        // 1. Sweep tone (1kHz → 10kHz, 2s)
+        const sweep = generateSweepTone(1000, 10000, 2.0, 44100);
+        await playSignalAsync(ctx, sweep);
+        addLog('info', '스윕 톤 완료 — OFDM 테스트 심볼 재생');
+
+        // 2. OFDM test symbol (preamble + CE)
+        const { signal } = generateTestSignal(modName, repetition);
+        await playSignalAsync(ctx, signal);
+
+        addLog('success', '출력 테스트 완료 — 스피커/케이블에서 소리가 들렸다면 정상입니다');
+        showTestResult('출력 테스트 완료', '스피커 또는 케이블에서 스윕 톤과 OFDM 신호가 정상적으로 재생되었습니다.', 'good');
+    } catch (err) {
+        addLog('error', `출력 테스트 오류: ${err.message}`);
+    }
+
+    testRunning = false;
+    setTestButtonsDisabled(false);
+}
+
+// --- Input Test ---
+async function runInputTest() {
+    if (testRunning) return;
+    testRunning = true;
+    setTestButtonsDisabled(true);
+    hideTestResults();
+
+    addLog('info', '입력 테스트 시작 — 3초간 녹음');
+
+    let stream;
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+                sampleRate: 44100,
+            }
+        });
+    } catch (err) {
+        addLog('error', `마이크 접근 실패: ${err.message}`);
+        testRunning = false;
+        setTestButtonsDisabled(false);
+        return;
+    }
+
+    const ctx = getAudioContext();
+    const source = ctx.createMediaStreamSource(stream);
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+    const chunks = [];
+    let totalSamples = 0;
+    const maxSamples = 3 * 44100;
+
+    await new Promise((resolve) => {
+        processor.onaudioprocess = (e) => {
+            const input = e.inputBuffer.getChannelData(0);
+            chunks.push(new Float32Array(input));
+            totalSamples += input.length;
+            if (totalSamples >= maxSamples) resolve();
+        };
+        source.connect(processor);
+        processor.connect(ctx.destination);
+    });
+
+    processor.disconnect();
+    source.disconnect();
+    stream.getTracks().forEach(t => t.stop());
+
+    // Concatenate
+    const recorded = new Float32Array(totalSamples);
+    let off = 0;
+    for (const c of chunks) { recorded.set(c, off); off += c.length; }
+
+    // Analyze
+    let sumSq = 0, peak = 0;
+    for (let i = 0; i < recorded.length; i++) {
+        const v = Math.abs(recorded[i]);
+        sumSq += recorded[i] * recorded[i];
+        if (v > peak) peak = v;
+    }
+    const rms = Math.sqrt(sumSq / recorded.length);
+    const rmsDb = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+    const peakDb = peak > 0 ? 20 * Math.log10(peak) : -Infinity;
+
+    // Noise floor: average RMS of bottom 10% blocks
+    const blockSize = 1024;
+    const numBlocks = Math.floor(recorded.length / blockSize);
+    const blockRms = [];
+    for (let b = 0; b < numBlocks; b++) {
+        let bSum = 0;
+        for (let i = 0; i < blockSize; i++) {
+            const v = recorded[b * blockSize + i];
+            bSum += v * v;
+        }
+        blockRms.push(Math.sqrt(bSum / blockSize));
+    }
+    blockRms.sort((a, b) => a - b);
+    const bottom10 = blockRms.slice(0, Math.max(1, Math.floor(numBlocks * 0.1)));
+    const noiseFloor = bottom10.reduce((s, v) => s + v, 0) / bottom10.length;
+    const noiseDb = noiseFloor > 0 ? 20 * Math.log10(noiseFloor) : -Infinity;
+
+    // FFT spectrum
+    const fftSize = 2048;
+    const specLen = Math.min(recorded.length, fftSize);
+    const fftRe = new Float64Array(fftSize);
+    const fftIm = new Float64Array(fftSize);
+    // Use middle portion of recording
+    const midStart = Math.max(0, Math.floor((recorded.length - fftSize) / 2));
+    for (let i = 0; i < specLen; i++) fftRe[i] = recorded[midStart + i];
+    const [specRe, specIm] = fft(fftRe, fftIm);
+
+    const magnitudes = new Float32Array(fftSize / 2);
+    for (let i = 0; i < fftSize / 2; i++) {
+        magnitudes[i] = Math.sqrt(specRe[i] * specRe[i] + specIm[i] * specIm[i]);
+    }
+
+    // Draw spectrum
+    const canvas = document.getElementById('test-spectrum-canvas');
+    canvas.style.display = 'block';
+    drawSpectrum(canvas, magnitudes);
+
+    // Assessment
+    const clipping = peak > 0.95;
+    const lowLevel = rms < 0.005;
+    let quality, message;
+    if (clipping) {
+        quality = 'poor';
+        message = `클리핑 감지! 볼륨을 낮춰주세요.\nRMS: ${rmsDb.toFixed(1)} dB · 피크: ${peakDb.toFixed(1)} dB · 노이즈: ${noiseDb.toFixed(1)} dB`;
+    } else if (lowLevel) {
+        quality = 'poor';
+        message = `입력 레벨이 너무 낮습니다. 볼륨을 높이거나 마이크를 확인하세요.\nRMS: ${rmsDb.toFixed(1)} dB · 피크: ${peakDb.toFixed(1)} dB · 노이즈: ${noiseDb.toFixed(1)} dB`;
+    } else {
+        quality = rms > 0.02 ? 'excellent' : 'good';
+        message = `입력 감도 양호\nRMS: ${rmsDb.toFixed(1)} dB · 피크: ${peakDb.toFixed(1)} dB · 노이즈: ${noiseDb.toFixed(1)} dB`;
+    }
+
+    addLog(quality === 'poor' ? 'warn' : 'success', `입력 테스트: RMS=${rmsDb.toFixed(1)}dB, 피크=${peakDb.toFixed(1)}dB`);
+    showTestResult('입력 테스트 결과', message, quality);
+
+    testRunning = false;
+    setTestButtonsDisabled(false);
+}
+
+// --- Loopback Test ---
+async function runLoopbackTest() {
+    if (testRunning) return;
+    testRunning = true;
+    setTestButtonsDisabled(true);
+    hideTestResults();
+
+    const { config, modName, repetition } = getModemParams(modulation);
+    setOFDMConfig(config);
+
+    addLog('info', '루프백 테스트 시작 — 테스트 신호 재생 + 동시 녹음');
+
+    let stream;
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+                sampleRate: 44100,
+            }
+        });
+    } catch (err) {
+        addLog('error', `마이크 접근 실패: ${err.message}`);
+        testRunning = false;
+        setTestButtonsDisabled(false);
+        return;
+    }
+
+    const ctx = getAudioContext();
+    const source = ctx.createMediaStreamSource(stream);
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+    const chunks = [];
+    let totalSamples = 0;
+    let recording = true;
+
+    processor.onaudioprocess = (e) => {
+        if (!recording) return;
+        const input = e.inputBuffer.getChannelData(0);
+        chunks.push(new Float32Array(input));
+        totalSamples += input.length;
+    };
+    source.connect(processor);
+    processor.connect(ctx.destination);
+
+    // Generate and play test signal
+    const { signal: testSignal, testData } = generateTestSignal(modName, repetition);
+    await playSignalAsync(ctx, testSignal);
+
+    // Wait 1 second after playback
+    await sleep(1000);
+
+    // Stop recording
+    recording = false;
+    processor.disconnect();
+    source.disconnect();
+    stream.getTracks().forEach(t => t.stop());
+
+    // Concatenate
+    const recorded = new Float32Array(totalSamples);
+    let off = 0;
+    for (const c of chunks) { recorded.set(c, off); off += c.length; }
+
+    addLog('info', `녹음 완료: ${(totalSamples / 44100).toFixed(1)}초 — 분석 중...`);
+
+    // Analyze
+    const result = analyzeLoopback(recorded, modName, repetition, testData);
+
+    // Draw channel response if available
+    if (result.channelMagnitude.length > 0) {
+        const canvas = document.getElementById('test-channel-canvas');
+        canvas.style.display = 'block';
+        drawChannelResponse(canvas, result.channelMagnitude);
+    }
+
+    // Build result message
+    const corrPct = (result.correlation * 100).toFixed(1);
+    const berPct = (result.ber * 100).toFixed(1);
+    let recommendedMod = '';
+    if (result.quality === 'excellent') {
+        recommendedMod = '16-QAM 또는 QPSK 사용 가능';
+    } else if (result.quality === 'good') {
+        recommendedMod = 'QPSK 또는 BPSK-ACOUSTIC 권장';
+    } else {
+        recommendedMod = 'BPSK-반복 또는 협대역 권장';
+    }
+
+    const message = [
+        `프리앰블 탐지: ${result.detected ? '성공' : '실패'}`,
+        `상관 피크: ${corrPct}%`,
+        `BER: ${berPct}%`,
+        `SNR 추정: ${isFinite(result.snrEstimate) ? result.snrEstimate.toFixed(1) + ' dB' : 'N/A'}`,
+        `권장 변조: ${recommendedMod}`,
+    ].join('\n');
+
+    addLog(result.quality === 'poor' ? 'warn' : 'success',
+        `루프백 테스트: 상관=${corrPct}%, BER=${berPct}%, 품질=${result.quality}`);
+    showTestResult('루프백 테스트 결과', message, result.quality);
+
+    testRunning = false;
+    setTestButtonsDisabled(false);
+}
+
+// --- Visualization Helpers ---
+
+function drawSpectrum(canvas, magnitudes) {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = canvas.clientWidth * dpr;
+    canvas.height = 100 * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    const w = canvas.clientWidth;
+    const h = 100;
+
+    ctx.fillStyle = '#0f0f23';
+    ctx.fillRect(0, 0, w, h);
+
+    // Convert to dB
+    const dbValues = new Float32Array(magnitudes.length);
+    let maxDb = -Infinity;
+    for (let i = 0; i < magnitudes.length; i++) {
+        dbValues[i] = magnitudes[i] > 1e-10 ? 20 * Math.log10(magnitudes[i]) : -100;
+        if (dbValues[i] > maxDb) maxDb = dbValues[i];
+    }
+    const minDb = maxDb - 80;
+
+    // OFDM band highlight
+    const freqPerBin = 44100 / (magnitudes.length * 2);
+    const bandStartHz = OFDM.SUB_START * freqPerBin;
+    const bandEndHz = OFDM.SUB_END * freqPerBin;
+    const xBandStart = (bandStartHz / 22050) * w;
+    const xBandEnd = (bandEndHz / 22050) * w;
+    ctx.fillStyle = 'rgba(0,212,255,0.08)';
+    ctx.fillRect(xBandStart, 0, xBandEnd - xBandStart, h);
+
+    // Spectrum line
+    ctx.beginPath();
+    ctx.strokeStyle = '#00d4ff';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < magnitudes.length; i++) {
+        const x = (i / magnitudes.length) * w;
+        const normalized = (dbValues[i] - minDb) / (maxDb - minDb);
+        const y = h - Math.max(0, Math.min(1, normalized)) * (h - 4);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Axis labels
+    ctx.fillStyle = '#666';
+    ctx.font = '10px monospace';
+    ctx.fillText('0 kHz', 2, h - 2);
+    ctx.fillText('11 kHz', w / 2 - 20, h - 2);
+    ctx.fillText('22 kHz', w - 36, h - 2);
+}
+
+function drawChannelResponse(canvas, channelMag) {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = canvas.clientWidth * dpr;
+    canvas.height = 100 * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    const w = canvas.clientWidth;
+    const h = 100;
+
+    ctx.fillStyle = '#0f0f23';
+    ctx.fillRect(0, 0, w, h);
+
+    if (channelMag.length === 0) return;
+
+    // Convert to dB
+    const dbValues = channelMag.map(m => m > 1e-10 ? 20 * Math.log10(m) : -60);
+    let maxDb = -Infinity, minDb = Infinity;
+    for (const d of dbValues) {
+        if (d > maxDb) maxDb = d;
+        if (d < minDb) minDb = d;
+    }
+    const range = Math.max(maxDb - minDb, 1);
+    const threshold = maxDb - 20; // 20dB below peak = severe attenuation
+
+    // Draw bars
+    const barW = Math.max(1, w / channelMag.length);
+    for (let i = 0; i < channelMag.length; i++) {
+        const x = (i / channelMag.length) * w;
+        const normalized = (dbValues[i] - minDb) / range;
+        const barH = Math.max(1, normalized * (h - 10));
+
+        ctx.fillStyle = dbValues[i] < threshold ? '#ff4444' : '#00d4ff';
+        ctx.fillRect(x, h - barH, Math.ceil(barW), barH);
+    }
+
+    // Labels
+    ctx.fillStyle = '#666';
+    ctx.font = '10px monospace';
+    ctx.fillText(`채널 응답 (${channelMag.length} 서브캐리어)`, 4, 12);
+    ctx.fillText(`${maxDb.toFixed(0)} dB`, w - 40, 12);
+}
+
+function getQualityBadge(quality) {
+    const map = {
+        excellent: '<span class="quality-badge quality-excellent">Excellent</span>',
+        good: '<span class="quality-badge quality-good">Good</span>',
+        poor: '<span class="quality-badge quality-poor">Poor</span>',
+    };
+    return map[quality] || map.poor;
+}
+
+function showTestResult(title, message, quality) {
+    const el = document.getElementById('test-result');
+    el.style.display = 'block';
+    el.innerHTML = `
+        <div class="test-result-box">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px">
+                <strong style="font-size:0.9rem">${title}</strong>
+                ${getQualityBadge(quality)}
+            </div>
+            <pre style="color:#aaa; font-size:0.8rem; font-family:inherit; white-space:pre-wrap; margin:0">${message}</pre>
+        </div>`;
+}
+
+function hideTestResults() {
+    document.getElementById('test-result').style.display = 'none';
+    document.getElementById('test-spectrum-canvas').style.display = 'none';
+    document.getElementById('test-channel-canvas').style.display = 'none';
+}

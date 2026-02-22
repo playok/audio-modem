@@ -882,3 +882,201 @@ function estimateFrameSamplesWithSilence(payloadBytes, modName, repetition, isFi
     const silencePost = Math.round(OFDM.SAMPLE_RATE * 0.02);
     return silencePre + coreSamples + silencePost;
 }
+
+// ============================================================
+// Pre-Test Functions — Audio Path Diagnostics
+// ============================================================
+
+function generateSweepTone(startFreq, endFreq, duration, sampleRate) {
+    const numSamples = Math.round(duration * sampleRate);
+    const signal = new Float32Array(numSamples);
+    const fadeLen = Math.round(0.05 * sampleRate); // 50ms fade
+
+    for (let i = 0; i < numSamples; i++) {
+        const t = i / sampleRate;
+        // Linear frequency sweep
+        const freq = startFreq + (endFreq - startFreq) * (t / duration);
+        const phase = 2 * Math.PI * (startFreq * t + (endFreq - startFreq) * t * t / (2 * duration));
+        let sample = 0.8 * Math.sin(phase);
+
+        // Fade-in/out envelope
+        if (i < fadeLen) {
+            sample *= i / fadeLen;
+        } else if (i > numSamples - fadeLen) {
+            sample *= (numSamples - i) / fadeLen;
+        }
+
+        signal[i] = sample;
+    }
+    return signal;
+}
+
+function generateTestSignal(modName, repetition) {
+    // Known 16-byte test data (0x00~0x0F)
+    const testData = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) testData[i] = i;
+
+    const nameBytes = new TextEncoder().encode('test');
+    const nameLen = nameBytes.length;
+
+    // Packet: [nameLen:1][name:N][dataLen:4][data][CRC-32:4]
+    const len = testData.length;
+    const packetSize = 1 + nameLen + 4 + len + 4;
+    const payload = new Uint8Array(packetSize);
+    let pOff = 0;
+
+    payload[pOff++] = nameLen;
+    for (let i = 0; i < nameLen; i++) payload[pOff++] = nameBytes[i];
+    payload[pOff++] = (len >> 24) & 0xFF;
+    payload[pOff++] = (len >> 16) & 0xFF;
+    payload[pOff++] = (len >> 8) & 0xFF;
+    payload[pOff++] = len & 0xFF;
+    payload.set(testData, pOff); pOff += len;
+
+    const checksum = crc32(payload.subarray(0, pOff));
+    payload[pOff++] = (checksum >> 24) & 0xFF;
+    payload[pOff++] = (checksum >> 16) & 0xFF;
+    payload[pOff++] = (checksum >> 8) & 0xFF;
+    payload[pOff++] = checksum & 0xFF;
+
+    let bits = bytesToBits(payload);
+    if (repetition > 1) bits = repeatBits(bits, repetition);
+    const { samples } = modulateOFDM(bits, modName);
+
+    // Build: silence + preamble + CE + data + silence
+    const pre1 = generatePreambleSymbol1();
+    const pre2 = generatePreambleSymbol2();
+    const ce = generateChannelEstSymbol();
+
+    const isAcoustic = OFDM.CP_LEN >= 128;
+    const silencePre = new Float32Array(OFDM.SAMPLE_RATE * (isAcoustic ? 0.5 : 0.3));
+    const silencePost = new Float32Array(OFDM.SAMPLE_RATE * (isAcoustic ? 0.5 : 0.2));
+
+    let totalLen = silencePre.length + pre1.length + pre2.length + ce.samples.length + silencePost.length;
+    for (const s of samples) totalLen += s.length;
+
+    const signal = new Float32Array(totalLen);
+    let off = 0;
+    signal.set(silencePre, off); off += silencePre.length;
+    signal.set(pre1, off); off += pre1.length;
+    signal.set(pre2, off); off += pre2.length;
+    signal.set(ce.samples, off); off += ce.samples.length;
+    for (const s of samples) { signal.set(s, off); off += s.length; }
+    signal.set(silencePost, off);
+
+    // Normalize
+    let mx = 0;
+    for (let i = 0; i < signal.length; i++) mx = Math.max(mx, Math.abs(signal[i]));
+    if (mx > 0) { const s = 0.8 / mx; for (let i = 0; i < signal.length; i++) signal[i] *= s; }
+
+    return { signal, testData };
+}
+
+function analyzeLoopback(recorded, modName, repetition, testData) {
+    // Preprocess
+    const signal = preprocessSignal(recorded);
+
+    // Preamble detection (coarse)
+    let coarseIdx = detectPreamble(signal);
+    if (coarseIdx < 0) {
+        // Fallback to cross-correlation
+        coarseIdx = detectPreambleCrossCorr(signal);
+    }
+    if (coarseIdx < 0) {
+        return { detected: false, correlation: 0, ber: 1, channelMagnitude: [], snrEstimate: 0, quality: 'poor' };
+    }
+
+    // Fine-tune with cross-correlation
+    const pre1 = generatePreambleSymbol1();
+    let tEnergy = 0;
+    for (let i = 0; i < pre1.length; i++) tEnergy += pre1[i] * pre1[i];
+
+    const searchRadius = OFDM.CP_LEN * 3;
+    const fineStart = Math.max(0, coarseIdx - searchRadius);
+    const fineEnd = Math.min(signal.length - pre1.length, coarseIdx + searchRadius);
+
+    let bestMetric = -Infinity, startIdx = coarseIdx;
+    for (let d = fineStart; d <= fineEnd; d++) {
+        let corr = 0, sEnergy = 0;
+        for (let i = 0; i < pre1.length; i++) {
+            corr += signal[d + i] * pre1[i];
+            sEnergy += signal[d + i] * signal[d + i];
+        }
+        const denom = Math.sqrt(sEnergy * tEnergy);
+        if (denom > 0.001) {
+            const metric = corr / denom;
+            if (metric > bestMetric) { bestMetric = metric; startIdx = d; }
+        }
+    }
+
+    const correlation = Math.max(0, bestMetric);
+
+    // Channel estimation
+    const ceStart = startIdx + 2 * OFDM.SYMBOL_LEN;
+    if (ceStart + OFDM.SYMBOL_LEN > signal.length) {
+        return { detected: true, correlation, ber: 1, channelMagnitude: [], snrEstimate: 0, quality: 'poor' };
+    }
+
+    const ceSamples = signal.slice(ceStart, ceStart + OFDM.SYMBOL_LEN);
+    const ce = generateChannelEstSymbol();
+    const [chRe, chIm] = estimateChannel(ceSamples, ce.knownRe, ce.knownIm);
+
+    // Channel magnitude per subcarrier
+    const channelMagnitude = [];
+    for (let k = OFDM.SUB_START; k <= OFDM.SUB_END; k++) {
+        const mag = Math.sqrt(chRe[k] * chRe[k] + chIm[k] * chIm[k]);
+        channelMagnitude.push(mag);
+    }
+
+    // SNR estimation from pilot subcarriers
+    let snrSum = 0, snrCount = 0;
+    for (const p of OFDM.PILOTS) {
+        if (p >= OFDM.SUB_START && p <= OFDM.SUB_END) {
+            const mag = Math.sqrt(chRe[p] * chRe[p] + chIm[p] * chIm[p]);
+            if (mag > 1e-6) {
+                snrSum += mag;
+                snrCount++;
+            }
+        }
+    }
+    const avgPilotMag = snrCount > 0 ? snrSum / snrCount : 0;
+    const snrEstimate = avgPilotMag > 0 ? 20 * Math.log10(avgPilotMag) : -Infinity;
+
+    // Demodulate data and calculate BER
+    const dataStart = ceStart + OFDM.SYMBOL_LEN;
+    let ber = 1;
+    if (dataStart < signal.length) {
+        const dataSamples = signal.slice(dataStart);
+        let bits = demodulateOFDM(dataSamples, modName, chRe, chIm);
+        if (repetition > 1) bits = majorityVote(bits, repetition);
+        const decoded = bitsToBytes(bits);
+
+        // Compare with known test data structure
+        // Packet: [nameLen:1][name:N][dataLen:4][data:16][CRC:4]
+        if (decoded.length >= 29) { // 1 + 4 + 4 + 16 + 4 = 29
+            const nameLen = decoded[0];
+            const dataOffset = 1 + nameLen + 4;
+            if (dataOffset + testData.length <= decoded.length) {
+                let errorBits = 0;
+                let totalBits = testData.length * 8;
+                for (let i = 0; i < testData.length; i++) {
+                    const xor = decoded[dataOffset + i] ^ testData[i];
+                    for (let b = 0; b < 8; b++) errorBits += (xor >> b) & 1;
+                }
+                ber = errorBits / totalBits;
+            }
+        }
+    }
+
+    // Quality assessment
+    let quality;
+    if (ber === 0 && correlation > 0.8) {
+        quality = 'excellent';
+    } else if (ber < 0.05) {
+        quality = 'good';
+    } else {
+        quality = 'poor';
+    }
+
+    return { detected: true, correlation, ber, channelMagnitude, snrEstimate, quality };
+}
