@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Modem</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f23; color: #e0e0e0; min-height: 100vh; }
+        .container { max-width: 640px; margin: 0 auto; padding: 16px; }
+
+        header { text-align: center; padding: 16px 0; }
+        h1 { font-size: 1.8rem; color: #00d4ff; margin-bottom: 2px; }
+        .subtitle { color: #888; font-size: 0.85rem; }
+        .badge { display: inline-block; margin-top: 8px; padding: 4px 12px; border-radius: 12px; font-size: 0.75rem; background: rgba(0,212,255,0.15); color: #00d4ff; }
+
+        .card { background: #1a1a2e; border-radius: 12px; padding: 16px; margin-bottom: 12px; border: 1px solid #2a2a4a; }
+        .card h2 { font-size: 1rem; margin-bottom: 10px; color: #00d4ff; }
+
+        .mode-selector { display: flex; gap: 10px; }
+        .mode-btn { flex: 1; padding: 14px; border: 2px solid #2a2a4a; border-radius: 10px; background: transparent; color: #888; cursor: pointer; font-size: 0.95rem; display: flex; flex-direction: column; align-items: center; gap: 6px; transition: all 0.2s; }
+        .mode-btn:hover { border-color: #00d4ff; color: #e0e0e0; }
+        .mode-btn.active { border-color: #00d4ff; background: rgba(0,212,255,0.1); color: #00d4ff; }
+        .mode-btn .icon { font-size: 1.4rem; }
+
+        .setting-row { display: flex; align-items: center; justify-content: space-between; }
+        .setting-row label { font-size: 0.9rem; color: #aaa; }
+        .setting-row select { background: #0f0f23; color: #e0e0e0; border: 1px solid #2a2a4a; border-radius: 6px; padding: 8px 12px; font-size: 0.85rem; }
+
+        .upload-area { border: 2px dashed #2a2a4a; border-radius: 10px; padding: 24px; text-align: center; cursor: pointer; position: relative; margin-bottom: 12px; transition: all 0.2s; }
+        .upload-area:hover { border-color: #00d4ff; background: rgba(0,212,255,0.05); }
+        .upload-area input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+        .upload-icon { font-size: 1.8rem; display: block; margin-bottom: 6px; }
+        .upload-area p { color: #888; font-size: 0.85rem; }
+        .file-info { color: #00d4ff !important; font-weight: 500; margin-top: 6px; }
+
+        .primary-btn { width: 100%; padding: 14px; border: none; border-radius: 10px; background: linear-gradient(135deg, #00d4ff, #0099cc); color: white; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        .primary-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(0,212,255,0.3); }
+        .primary-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .primary-btn.recording { background: linear-gradient(135deg, #ff4444, #cc0000); animation: pulse-btn 1.5s infinite; }
+        @keyframes pulse-btn { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+
+        .progress-bar { height: 8px; background: #0f0f23; border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #00d4ff, #00ff88); border-radius: 4px; transition: width 0.3s; width: 0%; }
+        .progress-info { display: flex; justify-content: space-between; font-size: 0.85rem; color: #aaa; }
+        .progress-message { margin-top: 6px; font-size: 0.85rem; color: #888; }
+
+        .log-container { max-height: 200px; overflow-y: auto; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 0.75rem; line-height: 1.5; }
+        .log-entry { padding: 2px 0; border-bottom: 1px solid rgba(42,42,74,0.5); }
+        .log-entry.info { color: #888; } .log-entry.warn { color: #ffaa00; } .log-entry.error { color: #ff4444; } .log-entry.success { color: #00ff88; }
+
+        .file-item { display: flex; align-items: center; padding: 10px; background: #0f0f23; border-radius: 8px; margin-top: 8px; }
+        .download-link { color: #00d4ff; text-decoration: none; font-size: 0.9rem; }
+        .download-link:hover { text-decoration: underline; }
+
+        .info-box { background: rgba(0,212,255,0.08); border: 1px solid rgba(0,212,255,0.2); border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; font-size: 0.8rem; color: #aaa; line-height: 1.6; }
+        .info-box strong { color: #00d4ff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Audio Modem</h1>
+            <p class="subtitle">스피커와 마이크로 파일을 전송합니다</p>
+            <span class="badge">서버 불필요 — 브라우저만으로 동작</span>
+        </header>
+
+        <main>
+            <div class="info-box">
+                <strong>사용법:</strong> 송신측은 <strong>파일 전송</strong>, 수신측은 <strong>파일 수신</strong>을 선택하세요.<br>
+                수신측이 먼저 <strong>수신 대기</strong>를 누른 후, 송신측이 <strong>전송 시작</strong>을 누르세요.<br>
+                완료 후 수신측에서 <strong>수신 중지</strong>를 누르면 복조가 시작됩니다.
+            </div>
+
+            <div class="card">
+                <h2>모드</h2>
+                <div class="mode-selector">
+                    <button id="btn-send-mode" class="mode-btn active" onclick="setMode('send')">
+                        <span class="icon">🔊</span><span>파일 전송</span>
+                    </button>
+                    <button id="btn-recv-mode" class="mode-btn" onclick="setMode('receive')">
+                        <span class="icon">🎙️</span><span>파일 수신</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>설정</h2>
+                <div class="setting-row">
+                    <label for="modulation">변조 방식</label>
+                    <select id="modulation">
+                        <option value="QPSK" selected>QPSK (~2.5 KB/s, 안정적)</option>
+                        <option value="16-QAM">16-QAM (~5 KB/s, 고속)</option>
+                    </select>
+                </div>
+            </div>
+
+            <div id="send-panel" class="card">
+                <h2>파일 전송 (스피커 출력)</h2>
+                <div class="upload-area" id="upload-area">
+                    <input type="file" id="file-input" onchange="handleFileSelect(event)">
+                    <div>
+                        <span class="upload-icon">📁</span>
+                        <p>파일을 선택하세요</p>
+                        <p id="file-info" class="file-info"></p>
+                    </div>
+                </div>
+                <button id="btn-send" class="primary-btn" onclick="startSend()" disabled>전송 시작</button>
+            </div>
+
+            <div id="receive-panel" class="card" style="display:none">
+                <h2>파일 수신 (마이크 입력)</h2>
+                <p style="color:#888; font-size:0.85rem; margin-bottom:12px">
+                    수신 대기를 누르면 마이크 권한을 요청합니다.<br>
+                    송신 완료 후 <strong>수신 중지</strong>를 눌러 복조하세요.
+                </p>
+                <button id="btn-receive" class="primary-btn" onclick="startReceive()">수신 대기</button>
+                <div id="received-files"></div>
+            </div>
+
+            <div id="progress-panel" class="card" style="display:none">
+                <h2>진행</h2>
+                <div class="progress-bar"><div id="progress-fill" class="progress-fill"></div></div>
+                <div class="progress-info">
+                    <span id="progress-percent">0%</span>
+                    <span id="progress-bytes"></span>
+                </div>
+                <p id="progress-message" class="progress-message"></p>
+            </div>
+
+            <div class="card">
+                <h2>로그</h2>
+                <div id="log-container" class="log-container">
+                    <div class="log-entry info">브라우저 오디오 모뎀 준비 완료</div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="modem.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

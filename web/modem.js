@@ -1,0 +1,493 @@
+// ============================================================
+// OFDM Audio Modem — Pure JavaScript Implementation
+// ============================================================
+
+// --- FFT ---
+function fft(re, im) {
+    const n = re.length;
+    const outRe = Float64Array.from(re);
+    const outIm = Float64Array.from(im);
+    bitReverse(outRe, outIm);
+    fftIterative(outRe, outIm, false);
+    return [outRe, outIm];
+}
+
+function ifft(re, im) {
+    const n = re.length;
+    const outRe = Float64Array.from(re);
+    const outIm = Float64Array.from(im);
+    bitReverse(outRe, outIm);
+    fftIterative(outRe, outIm, true);
+    const scale = 1 / n;
+    for (let i = 0; i < n; i++) { outRe[i] *= scale; outIm[i] *= scale; }
+    return [outRe, outIm];
+}
+
+function fftIterative(re, im, inverse) {
+    const n = re.length;
+    for (let size = 2; size <= n; size <<= 1) {
+        const half = size >> 1;
+        const sign = inverse ? 1 : -1;
+        const angle = sign * 2 * Math.PI / size;
+        const wnRe = Math.cos(angle), wnIm = Math.sin(angle);
+        for (let start = 0; start < n; start += size) {
+            let wRe = 1, wIm = 0;
+            for (let j = 0; j < half; j++) {
+                const i1 = start + j, i2 = start + j + half;
+                const tRe = wRe * re[i2] - wIm * im[i2];
+                const tIm = wRe * im[i2] + wIm * re[i2];
+                re[i2] = re[i1] - tRe; im[i2] = im[i1] - tIm;
+                re[i1] += tRe; im[i1] += tIm;
+                const nwRe = wRe * wnRe - wIm * wnIm;
+                wIm = wRe * wnIm + wIm * wnRe;
+                wRe = nwRe;
+            }
+        }
+    }
+}
+
+function bitReverse(re, im) {
+    const n = re.length;
+    let bits = 0, tmp = n;
+    while (tmp > 1) { bits++; tmp >>= 1; }
+    for (let i = 0; i < n; i++) {
+        const j = revBits(i, bits);
+        if (i < j) {
+            let t = re[i]; re[i] = re[j]; re[j] = t;
+            t = im[i]; im[i] = im[j]; im[j] = t;
+        }
+    }
+}
+
+function revBits(x, bits) {
+    let r = 0;
+    for (let i = 0; i < bits; i++) { r = (r << 1) | (x & 1); x >>= 1; }
+    return r;
+}
+
+// --- OFDM Parameters ---
+const OFDM = {
+    FFT_SIZE: 512,
+    CP_LEN: 64,
+    SYMBOL_LEN: 576,
+    SAMPLE_RATE: 44100,
+    SUB_START: 12,
+    SUB_END: 232,
+    PILOTS: [15, 29, 43, 57, 71, 85, 99, 113, 127, 141, 155, 169, 183, 197, 211, 225],
+};
+
+OFDM.isPilot = (k) => OFDM.PILOTS.includes(k);
+OFDM.numDataSubs = () => {
+    let c = 0;
+    for (let k = OFDM.SUB_START; k <= OFDM.SUB_END; k++) if (!OFDM.isPilot(k)) c++;
+    return c;
+};
+
+// --- Constellation ---
+const Constellations = {
+    QPSK: { bps: 2, points: null },
+    QAM16: { bps: 4, points: null },
+};
+
+function initConstellation(name) {
+    const c = Constellations[name];
+    if (c.points) return c;
+    if (name === 'QPSK') {
+        const s = 1 / Math.SQRT2;
+        c.points = [
+            [s, s], [-s, s], [-s, -s], [s, -s]
+        ];
+    } else if (name === 'QAM16') {
+        const raw = [];
+        for (let i = 0; i < 16; i++) {
+            const row = i >> 2, col = i & 3;
+            const gr = row ^ (row >> 1), gc = col ^ (col >> 1);
+            raw.push([2 * gc - 3, 2 * gr - 3]);
+        }
+        let avg = 0;
+        for (const p of raw) avg += p[0] * p[0] + p[1] * p[1];
+        avg /= raw.length;
+        const s = 1 / Math.sqrt(avg);
+        c.points = raw.map(p => [p[0] * s, p[1] * s]);
+    }
+    return c;
+}
+
+function constellationMap(c, bits) {
+    let idx = 0;
+    for (const b of bits) idx = (idx << 1) | (b & 1);
+    const p = c.points[idx % c.points.length];
+    return p;
+}
+
+function constellationDemap(c, re, im) {
+    let minD = Infinity, minIdx = 0;
+    for (let i = 0; i < c.points.length; i++) {
+        const dr = re - c.points[i][0], di = im - c.points[i][1];
+        const d = dr * dr + di * di;
+        if (d < minD) { minD = d; minIdx = i; }
+    }
+    const bits = [];
+    for (let i = c.bps - 1; i >= 0; i--) bits.push((minIdx >> i) & 1);
+    return bits;
+}
+
+// --- Preamble (Schmidl-Cox) ---
+function seededRandom(seed) {
+    let s = seed;
+    return () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+}
+
+function generatePreambleSymbol1() {
+    const re = new Float64Array(OFDM.FFT_SIZE);
+    const im = new Float64Array(OFDM.FFT_SIZE);
+    const rng = seededRandom(42);
+    for (let k = OFDM.SUB_START; k <= OFDM.SUB_END; k += 2) {
+        re[k] = rng() > 0.5 ? 1 : -1;
+    }
+    const n = OFDM.FFT_SIZE;
+    for (let k = 1; k < n / 2; k++) { re[n - k] = re[k]; im[n - k] = -im[k]; }
+    re[0] = 0; re[n / 2] = 0; im[n / 2] = 0;
+    const [td] = ifft(re, im);
+    return addCP(td);
+}
+
+function generatePreambleSymbol2() {
+    const re = new Float64Array(OFDM.FFT_SIZE);
+    const im = new Float64Array(OFDM.FFT_SIZE);
+    const rng = seededRandom(43);
+    for (let k = OFDM.SUB_START; k <= OFDM.SUB_END; k++) {
+        re[k] = rng() > 0.5 ? 1 : -1;
+    }
+    const n = OFDM.FFT_SIZE;
+    for (let k = 1; k < n / 2; k++) { re[n - k] = re[k]; im[n - k] = -im[k]; }
+    re[0] = 0; re[n / 2] = 0; im[n / 2] = 0;
+    const [td] = ifft(re, im);
+    return addCP(td);
+}
+
+function generateChannelEstSymbol() {
+    const re = new Float64Array(OFDM.FFT_SIZE);
+    const im = new Float64Array(OFDM.FFT_SIZE);
+    const knownRe = new Float64Array(OFDM.FFT_SIZE);
+    const rng = seededRandom(44);
+    for (let k = OFDM.SUB_START; k <= OFDM.SUB_END; k++) {
+        const v = rng() > 0.5 ? 1 : -1;
+        re[k] = v; knownRe[k] = v;
+    }
+    const n = OFDM.FFT_SIZE;
+    for (let k = 1; k < n / 2; k++) { re[n - k] = re[k]; im[n - k] = -im[k]; }
+    re[0] = 0; re[n / 2] = 0; im[n / 2] = 0;
+    const [td] = ifft(re, im);
+    return { samples: addCP(td), knownRe, knownIm: new Float64Array(OFDM.FFT_SIZE) };
+}
+
+function addCP(td) {
+    const n = td.length, cp = OFDM.CP_LEN;
+    const out = new Float32Array(cp + n);
+    for (let i = 0; i < cp; i++) out[i] = td[n - cp + i];
+    for (let i = 0; i < n; i++) out[cp + i] = td[i];
+    return out;
+}
+
+// --- Preamble Detection (Sliding Window, O(n)) ---
+function detectPreamble(signal) {
+    const half = OFDM.FFT_SIZE / 2; // 256
+    const len = signal.length;
+    if (len < 2 * half) return -1;
+
+    // Compute initial P(0) and R(0)
+    let p = 0, r = 0;
+    for (let m = 0; m < half; m++) {
+        p += signal[m] * signal[m + half];
+        r += signal[m + half] * signal[m + half];
+    }
+
+    let best = 0, bestIdx = -1;
+    const end = len - 2 * half;
+
+    for (let d = 0; d <= end; d++) {
+        if (r > 1e-6) {
+            const metric = (p * p) / (r * r);
+            if (metric > best) { best = metric; bestIdx = d; }
+        }
+        if (d < end) {
+            const mid = d + half;
+            const enter = d + 2 * half;
+            p += signal[mid] * signal[enter] - signal[d] * signal[mid];
+            r += signal[enter] * signal[enter] - signal[mid] * signal[mid];
+        }
+    }
+
+    return best > 0.3 ? bestIdx : -1;
+}
+
+// --- Modulation ---
+function modulateOFDM(bits, modName) {
+    const c = initConstellation(modName);
+    const bps = c.bps;
+    const numDataSubs = OFDM.numDataSubs();
+    const bitsPerSymbol = numDataSubs * bps;
+
+    // Pad bits
+    while (bits.length % bitsPerSymbol !== 0) bits.push(0);
+
+    const numSymbols = bits.length / bitsPerSymbol;
+    const allSamples = [];
+
+    for (let s = 0; s < numSymbols; s++) {
+        const symBits = bits.slice(s * bitsPerSymbol, (s + 1) * bitsPerSymbol);
+        const specRe = new Float64Array(OFDM.FFT_SIZE);
+        const specIm = new Float64Array(OFDM.FFT_SIZE);
+
+        let di = 0;
+        for (let k = OFDM.SUB_START; k <= OFDM.SUB_END; k++) {
+            if (OFDM.isPilot(k)) {
+                specRe[k] = 1; specIm[k] = 0;
+            } else {
+                const b = symBits.slice(di * bps, (di + 1) * bps);
+                const p = constellationMap(c, b);
+                specRe[k] = p[0]; specIm[k] = p[1];
+                di++;
+            }
+        }
+
+        // Hermitian symmetry
+        const n = OFDM.FFT_SIZE;
+        for (let k = 1; k < n / 2; k++) { specRe[n - k] = specRe[k]; specIm[n - k] = -specIm[k]; }
+        specRe[0] = 0; specIm[0] = 0; specIm[n / 2] = 0;
+
+        const [td] = ifft(specRe, specIm);
+        const sym = addCP(td);
+        allSamples.push(sym);
+    }
+
+    return { samples: allSamples, numSymbols, bitsPerSymbol };
+}
+
+// --- Demodulation ---
+function demodulateOFDM(signal, modName, channelRe, channelIm) {
+    const c = initConstellation(modName);
+    const bps = c.bps;
+    const numSymbols = Math.floor(signal.length / OFDM.SYMBOL_LEN);
+    const allBits = [];
+
+    for (let s = 0; s < numSymbols; s++) {
+        const offset = s * OFDM.SYMBOL_LEN;
+        // Remove CP
+        const re = new Float64Array(OFDM.FFT_SIZE);
+        const im = new Float64Array(OFDM.FFT_SIZE);
+        for (let i = 0; i < OFDM.FFT_SIZE; i++) {
+            re[i] = signal[offset + OFDM.CP_LEN + i] || 0;
+        }
+
+        // FFT
+        const [specRe, specIm] = fft(re, im);
+
+        // Equalize
+        const eqRe = new Float64Array(OFDM.FFT_SIZE);
+        const eqIm = new Float64Array(OFDM.FFT_SIZE);
+        for (let k = OFDM.SUB_START; k <= OFDM.SUB_END; k++) {
+            const hr = channelRe[k], hi = channelIm[k];
+            const hMag = hr * hr + hi * hi;
+            if (hMag > 1e-10) {
+                eqRe[k] = (specRe[k] * hr + specIm[k] * hi) / hMag;
+                eqIm[k] = (specIm[k] * hr - specRe[k] * hi) / hMag;
+            } else {
+                eqRe[k] = specRe[k]; eqIm[k] = specIm[k];
+            }
+        }
+
+        // Phase correction from pilots
+        let phaseSum = 0, pc = 0;
+        for (const p of OFDM.PILOTS) {
+            if (p >= OFDM.SUB_START && p <= OFDM.SUB_END && Math.abs(eqRe[p]) > 1e-6) {
+                phaseSum += eqIm[p] / eqRe[p];
+                pc++;
+            }
+        }
+        const phase = pc > 0 ? phaseSum / pc : 0;
+
+        // Demap
+        for (let k = OFDM.SUB_START; k <= OFDM.SUB_END; k++) {
+            if (!OFDM.isPilot(k)) {
+                const cr = eqRe[k] + eqIm[k] * phase;
+                const ci = eqIm[k] - eqRe[k] * phase;
+                allBits.push(...constellationDemap(c, cr, ci));
+            }
+        }
+    }
+
+    return allBits;
+}
+
+// --- Channel Estimation ---
+function estimateChannel(receivedSamples, knownRe, knownIm) {
+    const re = new Float64Array(OFDM.FFT_SIZE);
+    const im = new Float64Array(OFDM.FFT_SIZE);
+    for (let i = 0; i < OFDM.FFT_SIZE; i++) {
+        re[i] = receivedSamples[OFDM.CP_LEN + i] || 0;
+    }
+    const [specRe, specIm] = fft(re, im);
+
+    const chRe = new Float64Array(OFDM.FFT_SIZE);
+    const chIm = new Float64Array(OFDM.FFT_SIZE);
+    for (let k = OFDM.SUB_START; k <= OFDM.SUB_END; k++) {
+        const xr = knownRe[k], xi = knownIm[k];
+        const d = xr * xr + xi * xi;
+        if (d > 1e-10) {
+            chRe[k] = (specRe[k] * xr + specIm[k] * xi) / d;
+            chIm[k] = (specIm[k] * xr - specRe[k] * xi) / d;
+        }
+    }
+    return [chRe, chIm];
+}
+
+// --- CRC-32 ---
+const CRC32_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[i] = c;
+    }
+    return t;
+})();
+
+function crc32(data) {
+    let c = 0xFFFFFFFF;
+    for (const b of data) c = CRC32_TABLE[(c ^ b) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// --- Byte/Bit Conversion ---
+function bytesToBits(data) {
+    const bits = [];
+    for (const b of data) {
+        for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
+    }
+    return bits;
+}
+
+function bitsToBytes(bits) {
+    const bytes = [];
+    for (let i = 0; i + 7 < bits.length; i += 8) {
+        let b = 0;
+        for (let j = 0; j < 8; j++) b = (b << 1) | (bits[i + j] & 1);
+        bytes.push(b);
+    }
+    return new Uint8Array(bytes);
+}
+
+// --- Frame Building ---
+function buildTransmitSignal(fileData, modName, fileName) {
+    // Encode filename
+    const nameBytes = new TextEncoder().encode(fileName || 'file');
+    const nameLen = Math.min(nameBytes.length, 255);
+
+    // Packet: [nameLen:1][name:N][dataLen:4][data][CRC-32:4]
+    const len = fileData.length;
+    const packetSize = 1 + nameLen + 4 + len + 4;
+    const payload = new Uint8Array(packetSize);
+    let pOff = 0;
+
+    payload[pOff++] = nameLen;
+    for (let i = 0; i < nameLen; i++) payload[pOff++] = nameBytes[i];
+    payload[pOff++] = (len >> 24) & 0xFF;
+    payload[pOff++] = (len >> 16) & 0xFF;
+    payload[pOff++] = (len >> 8) & 0xFF;
+    payload[pOff++] = len & 0xFF;
+    payload.set(fileData, pOff); pOff += len;
+
+    const checksum = crc32(payload.subarray(0, pOff));
+    payload[pOff++] = (checksum >> 24) & 0xFF;
+    payload[pOff++] = (checksum >> 16) & 0xFF;
+    payload[pOff++] = (checksum >> 8) & 0xFF;
+    payload[pOff++] = checksum & 0xFF;
+
+    const bits = bytesToBits(payload);
+    const { samples, numSymbols, bitsPerSymbol } = modulateOFDM(bits, modName);
+
+    // Build full signal: silence + preamble + CE + data + silence
+    const pre1 = generatePreambleSymbol1();
+    const pre2 = generatePreambleSymbol2();
+    const ce = generateChannelEstSymbol();
+
+    const silencePre = new Float32Array(OFDM.SAMPLE_RATE * 0.3);
+    const silencePost = new Float32Array(OFDM.SAMPLE_RATE * 0.2);
+
+    let totalLen = silencePre.length + pre1.length + pre2.length + ce.samples.length + silencePost.length;
+    for (const s of samples) totalLen += s.length;
+
+    const signal = new Float32Array(totalLen);
+    let off = 0;
+    signal.set(silencePre, off); off += silencePre.length;
+    signal.set(pre1, off); off += pre1.length;
+    signal.set(pre2, off); off += pre2.length;
+    signal.set(ce.samples, off); off += ce.samples.length;
+    for (const s of samples) { signal.set(s, off); off += s.length; }
+    signal.set(silencePost, off);
+
+    // Normalize entire signal uniformly (critical for channel estimation)
+    let mx = 0;
+    for (let i = 0; i < signal.length; i++) mx = Math.max(mx, Math.abs(signal[i]));
+    if (mx > 0) { const s = 0.8 / mx; for (let i = 0; i < signal.length; i++) signal[i] *= s; }
+
+    return { signal, numSymbols, bitsPerSymbol, totalBits: bits.length, dataLen: len };
+}
+
+function decodeReceivedSignal(signal, modName) {
+    // Detect preamble
+    const startIdx = detectPreamble(signal);
+    if (startIdx < 0) return { error: 'Preamble not detected' };
+
+    // Channel estimation
+    const ceStart = startIdx + 2 * OFDM.SYMBOL_LEN;
+    if (ceStart + OFDM.SYMBOL_LEN > signal.length) return { error: 'Signal too short for CE' };
+
+    const ceSamples = signal.slice(ceStart, ceStart + OFDM.SYMBOL_LEN);
+    const ce = generateChannelEstSymbol();
+    const [chRe, chIm] = estimateChannel(ceSamples, ce.knownRe, ce.knownIm);
+
+    // Demodulate data
+    const dataStart = ceStart + OFDM.SYMBOL_LEN;
+    if (dataStart >= signal.length) return { error: 'No data after CE' };
+
+    const dataSamples = signal.slice(dataStart);
+    const bits = demodulateOFDM(dataSamples, modName, chRe, chIm);
+    const bytes = bitsToBytes(bits);
+
+    if (bytes.length < 10) return { error: 'Decoded data too short' };
+
+    // Parse: [nameLen:1][name:N][dataLen:4][data][CRC-32:4]
+    let off = 0;
+    const nameLen = bytes[off++];
+    if (off + nameLen + 4 + 4 > bytes.length) return { error: 'Decoded data too short for header' };
+
+    let fileName = '';
+    try { fileName = new TextDecoder().decode(bytes.slice(off, off + nameLen)); } catch(e) {}
+    off += nameLen;
+
+    const dataLen = (bytes[off] << 24) | (bytes[off+1] << 16) | (bytes[off+2] << 8) | bytes[off+3];
+    off += 4;
+
+    if (dataLen <= 0 || off + dataLen + 4 > bytes.length) return { error: `Invalid data length: ${dataLen}` };
+
+    const fileData = bytes.slice(off, off + dataLen);
+    off += dataLen;
+
+    // Verify CRC
+    const expectedCRC = ((bytes[off] << 24) | (bytes[off+1] << 16) |
+                          (bytes[off+2] << 8) | bytes[off+3]) >>> 0;
+    const actualCRC = crc32(bytes.subarray(0, off));
+
+    return {
+        data: fileData,
+        dataLen,
+        fileName,
+        crcValid: expectedCRC === actualCRC,
+        expectedCRC,
+        actualCRC,
+        preambleIdx: startIdx,
+    };
+}
