@@ -77,6 +77,11 @@ const OFDM_CONFIGS = {
         SUB_START: 23, SUB_END: 93,   // ~2000Hz–8000Hz (스피커/마이크 안정 대역)
         PILOTS: [25, 35, 45, 55, 65, 75, 85],
     },
+    narrowband: {
+        FFT_SIZE: 512, CP_LEN: 256, SYMBOL_LEN: 768, SAMPLE_RATE: 44100,
+        SUB_START: 35, SUB_END: 58,   // ~3000Hz–5000Hz (가장 안정적인 대역)
+        PILOTS: [37, 45, 53],
+    },
 };
 
 const OFDM = { ...OFDM_CONFIGS.standard };
@@ -470,8 +475,28 @@ function bitsToBytes(bits) {
     return new Uint8Array(bytes);
 }
 
+// --- Repetition Coding ---
+function repeatBits(bits, n) {
+    const out = [];
+    for (const b of bits) {
+        for (let i = 0; i < n; i++) out.push(b);
+    }
+    return out;
+}
+
+function majorityVote(bits, n) {
+    const out = [];
+    for (let i = 0; i + n - 1 < bits.length; i += n) {
+        let sum = 0;
+        for (let j = 0; j < n; j++) sum += bits[i + j];
+        out.push(sum >= n / 2 ? 1 : 0);
+    }
+    return out;
+}
+
 // --- Frame Building ---
-function buildTransmitSignal(fileData, modName, fileName) {
+function buildTransmitSignal(fileData, modName, fileName, repetition) {
+    repetition = repetition || 1;
     // Encode filename
     const nameBytes = new TextEncoder().encode(fileName || 'file');
     const nameLen = Math.min(nameBytes.length, 255);
@@ -496,7 +521,8 @@ function buildTransmitSignal(fileData, modName, fileName) {
     payload[pOff++] = (checksum >> 8) & 0xFF;
     payload[pOff++] = checksum & 0xFF;
 
-    const bits = bytesToBits(payload);
+    let bits = bytesToBits(payload);
+    if (repetition > 1) bits = repeatBits(bits, repetition);
     const { samples, numSymbols, bitsPerSymbol } = modulateOFDM(bits, modName);
 
     // Build full signal: silence + preamble + CE + data + silence
@@ -528,7 +554,8 @@ function buildTransmitSignal(fileData, modName, fileName) {
     return { signal, numSymbols, bitsPerSymbol, totalBits: bits.length, dataLen: len };
 }
 
-function decodeReceivedSignal(signal, modName) {
+function decodeReceivedSignal(signal, modName, repetition) {
+    repetition = repetition || 1;
     // Preprocess: DC removal + normalize
     signal = preprocessSignal(signal);
 
@@ -573,12 +600,26 @@ function decodeReceivedSignal(signal, modName) {
     if (dataStart >= signal.length) return { error: 'No data after CE' };
 
     const dataSamples = signal.slice(dataStart);
-    const bits = demodulateOFDM(dataSamples, modName, chRe, chIm);
+    let bits = demodulateOFDM(dataSamples, modName, chRe, chIm);
+    if (repetition > 1) bits = majorityVote(bits, repetition);
     const bytes = bitsToBytes(bits);
 
     if (bytes.length < 10) return { error: 'Decoded data too short' };
 
-    // Parse: [nameLen:1][name:N][dataLen:4][data][CRC-32:4]
+    // Check for chunk frame types (0xFE = metadata, 0xFF = data chunk)
+    const firstByte = bytes[0];
+    if (firstByte === 0xFE) {
+        const result = parseMetadataResult(bytes);
+        result.preambleIdx = startIdx;
+        return result;
+    }
+    if (firstByte === 0xFF) {
+        const result = parseDataChunkResult(bytes);
+        result.preambleIdx = startIdx;
+        return result;
+    }
+
+    // Legacy packet: [nameLen:1][name:N][dataLen:4][data][CRC-32:4]
     let off = 0;
     const nameLen = bytes[off++];
     if (off + nameLen + 4 + 4 > bytes.length) return { error: 'Decoded data too short for header' };
@@ -608,5 +649,236 @@ function decodeReceivedSignal(signal, modName) {
         expectedCRC,
         actualCRC,
         preambleIdx: startIdx,
+        frameType: 'legacy',
     };
+}
+
+// ============================================================
+// Chunked Transfer Protocol — Large File Support
+// ============================================================
+
+// Frame type magic bytes
+const FRAME_META = 0xFE;
+const FRAME_DATA = 0xFF;
+
+// --- Chunk Frame Payload Builders ---
+
+function buildMetadataPayload(totalChunks, totalFileSize, chunkSize, fileName) {
+    const nameBytes = new TextEncoder().encode(fileName || 'file');
+    const nameLen = Math.min(nameBytes.length, 255);
+    // [0xFE:1][totalChunks:4][totalFileSize:4][chunkSize:2][fileNameLen:1][fileName:N][CRC-32:4]
+    const size = 1 + 4 + 4 + 2 + 1 + nameLen + 4;
+    const buf = new Uint8Array(size);
+    let off = 0;
+    buf[off++] = FRAME_META;
+    buf[off++] = (totalChunks >> 24) & 0xFF;
+    buf[off++] = (totalChunks >> 16) & 0xFF;
+    buf[off++] = (totalChunks >> 8) & 0xFF;
+    buf[off++] = totalChunks & 0xFF;
+    buf[off++] = (totalFileSize >> 24) & 0xFF;
+    buf[off++] = (totalFileSize >> 16) & 0xFF;
+    buf[off++] = (totalFileSize >> 8) & 0xFF;
+    buf[off++] = totalFileSize & 0xFF;
+    buf[off++] = (chunkSize >> 8) & 0xFF;
+    buf[off++] = chunkSize & 0xFF;
+    buf[off++] = nameLen;
+    for (let i = 0; i < nameLen; i++) buf[off++] = nameBytes[i];
+    const checksum = crc32(buf.subarray(0, off));
+    buf[off++] = (checksum >> 24) & 0xFF;
+    buf[off++] = (checksum >> 16) & 0xFF;
+    buf[off++] = (checksum >> 8) & 0xFF;
+    buf[off++] = checksum & 0xFF;
+    return buf;
+}
+
+function buildDataChunkPayload(chunkData, seqNum) {
+    const dataLen = chunkData.length;
+    // [0xFF:1][seqNum:4][chunkDataLen:2][data:N][CRC-32:4]
+    const size = 1 + 4 + 2 + dataLen + 4;
+    const buf = new Uint8Array(size);
+    let off = 0;
+    buf[off++] = FRAME_DATA;
+    buf[off++] = (seqNum >> 24) & 0xFF;
+    buf[off++] = (seqNum >> 16) & 0xFF;
+    buf[off++] = (seqNum >> 8) & 0xFF;
+    buf[off++] = seqNum & 0xFF;
+    buf[off++] = (dataLen >> 8) & 0xFF;
+    buf[off++] = dataLen & 0xFF;
+    buf.set(chunkData, off); off += dataLen;
+    const checksum = crc32(buf.subarray(0, off));
+    buf[off++] = (checksum >> 24) & 0xFF;
+    buf[off++] = (checksum >> 16) & 0xFF;
+    buf[off++] = (checksum >> 8) & 0xFF;
+    buf[off++] = checksum & 0xFF;
+    return buf;
+}
+
+// --- Build complete OFDM frames for chunk payloads ---
+
+function buildChunkOFDMFrame(payload, modName, repetition, isFirstFrame) {
+    repetition = repetition || 1;
+    let bits = bytesToBits(payload);
+    if (repetition > 1) bits = repeatBits(bits, repetition);
+    const { samples } = modulateOFDM(bits, modName);
+
+    const pre1 = generatePreambleSymbol1();
+    const pre2 = generatePreambleSymbol2();
+    const ce = generateChannelEstSymbol();
+
+    const isAcoustic = OFDM.CP_LEN >= 128;
+    // First frame (metadata) uses longer silence for initial sync
+    const silencePreLen = isFirstFrame
+        ? Math.round(OFDM.SAMPLE_RATE * (isAcoustic ? 0.5 : 0.3))
+        : Math.round(OFDM.SAMPLE_RATE * 0.05);
+    const silencePostLen = Math.round(OFDM.SAMPLE_RATE * 0.02);
+
+    const silencePre = new Float32Array(silencePreLen);
+    const silencePost = new Float32Array(silencePostLen);
+
+    let totalLen = silencePre.length + pre1.length + pre2.length + ce.samples.length + silencePost.length;
+    for (const s of samples) totalLen += s.length;
+
+    const signal = new Float32Array(totalLen);
+    let off = 0;
+    signal.set(silencePre, off); off += silencePre.length;
+    signal.set(pre1, off); off += pre1.length;
+    signal.set(pre2, off); off += pre2.length;
+    signal.set(ce.samples, off); off += ce.samples.length;
+    for (const s of samples) { signal.set(s, off); off += s.length; }
+    signal.set(silencePost, off);
+
+    // Normalize
+    let mx = 0;
+    for (let i = 0; i < signal.length; i++) mx = Math.max(mx, Math.abs(signal[i]));
+    if (mx > 0) { const s = 0.8 / mx; for (let i = 0; i < signal.length; i++) signal[i] *= s; }
+
+    return signal;
+}
+
+function buildMetadataFrame(totalChunks, totalFileSize, chunkSize, fileName, modName, rep) {
+    const payload = buildMetadataPayload(totalChunks, totalFileSize, chunkSize, fileName);
+    return buildChunkOFDMFrame(payload, modName, rep, true);
+}
+
+function buildDataChunkFrame(chunkData, seqNum, modName, rep) {
+    const payload = buildDataChunkPayload(chunkData, seqNum);
+    return buildChunkOFDMFrame(payload, modName, rep, false);
+}
+
+// --- Decode chunk frame (after preamble detection + CE) ---
+
+function decodeChunkFrame(frameSamples, modName, repetition) {
+    repetition = repetition || 1;
+    // frameSamples should start from preamble1
+    // Structure: [preamble1][preamble2][CE][data symbols...]
+    const ceStart = 2 * OFDM.SYMBOL_LEN;
+    if (ceStart + OFDM.SYMBOL_LEN > frameSamples.length) {
+        return { error: 'Frame too short for CE' };
+    }
+
+    const ceSamples = frameSamples.slice(ceStart, ceStart + OFDM.SYMBOL_LEN);
+    const ce = generateChannelEstSymbol();
+    const [chRe, chIm] = estimateChannel(ceSamples, ce.knownRe, ce.knownIm);
+
+    const dataStart = ceStart + OFDM.SYMBOL_LEN;
+    if (dataStart >= frameSamples.length) {
+        return { error: 'No data after CE' };
+    }
+
+    const dataSamples = frameSamples.slice(dataStart);
+    let bits = demodulateOFDM(dataSamples, modName, chRe, chIm);
+    if (repetition > 1) bits = majorityVote(bits, repetition);
+    const bytes = bitsToBytes(bits);
+
+    if (bytes.length < 6) return { error: 'Decoded data too short' };
+
+    const frameType = bytes[0];
+    if (frameType === FRAME_META) {
+        return parseMetadataResult(bytes);
+    } else if (frameType === FRAME_DATA) {
+        return parseDataChunkResult(bytes);
+    } else {
+        return { error: `Unknown frame type: 0x${frameType.toString(16)}`, frameType };
+    }
+}
+
+function parseMetadataResult(bytes) {
+    // [0xFE:1][totalChunks:4][totalFileSize:4][chunkSize:2][fileNameLen:1][fileName:N][CRC-32:4]
+    if (bytes.length < 16) return { error: 'Metadata frame too short' };
+    let off = 1;
+    const totalChunks = (bytes[off] << 24) | (bytes[off+1] << 16) | (bytes[off+2] << 8) | bytes[off+3]; off += 4;
+    const totalFileSize = (bytes[off] << 24) | (bytes[off+1] << 16) | (bytes[off+2] << 8) | bytes[off+3]; off += 4;
+    const chunkSize = (bytes[off] << 8) | bytes[off+1]; off += 2;
+    const nameLen = bytes[off++];
+    if (off + nameLen + 4 > bytes.length) return { error: 'Metadata frame truncated' };
+    let fileName = '';
+    try { fileName = new TextDecoder().decode(bytes.slice(off, off + nameLen)); } catch(e) {}
+    off += nameLen;
+
+    // Verify CRC
+    const expectedCRC = ((bytes[off] << 24) | (bytes[off+1] << 16) | (bytes[off+2] << 8) | bytes[off+3]) >>> 0;
+    const actualCRC = crc32(bytes.subarray(0, off));
+
+    return {
+        frameType: FRAME_META,
+        totalChunks, totalFileSize, chunkSize, fileName,
+        crcValid: expectedCRC === actualCRC,
+        expectedCRC, actualCRC,
+    };
+}
+
+function parseDataChunkResult(bytes) {
+    // [0xFF:1][seqNum:4][chunkDataLen:2][data:N][CRC-32:4]
+    if (bytes.length < 11) return { error: 'Data chunk frame too short' };
+    let off = 1;
+    const seqNum = (bytes[off] << 24) | (bytes[off+1] << 16) | (bytes[off+2] << 8) | bytes[off+3]; off += 4;
+    const dataLen = (bytes[off] << 8) | bytes[off+1]; off += 2;
+    if (off + dataLen + 4 > bytes.length) return { error: 'Data chunk truncated' };
+    const data = bytes.slice(off, off + dataLen);
+    off += dataLen;
+
+    const expectedCRC = ((bytes[off] << 24) | (bytes[off+1] << 16) | (bytes[off+2] << 8) | bytes[off+3]) >>> 0;
+    const actualCRC = crc32(bytes.subarray(0, off));
+
+    return {
+        frameType: FRAME_DATA,
+        seqNum, data, dataLen,
+        crcValid: expectedCRC === actualCRC,
+        expectedCRC, actualCRC,
+    };
+}
+
+// --- Parse helpers (for external use after raw byte extraction) ---
+
+function parseMetadataPayload(bytes) {
+    return parseMetadataResult(bytes);
+}
+
+function parseDataChunkPayload(bytes) {
+    return parseDataChunkResult(bytes);
+}
+
+// --- Estimate frame sample count ---
+
+function estimateFrameSamples(payloadBytes, modName, repetition) {
+    repetition = repetition || 1;
+    const c = initConstellation(modName);
+    const numDataSubs = OFDM.numDataSubs();
+    const bitsPerSymbol = numDataSubs * c.bps;
+    const totalBits = payloadBytes * 8 * repetition;
+    const numSymbols = Math.ceil(totalBits / bitsPerSymbol);
+
+    // preamble1 + preamble2 + CE + data symbols
+    const headerSymbols = 3; // pre1 + pre2 + CE
+    return (headerSymbols + numSymbols) * OFDM.SYMBOL_LEN;
+}
+
+function estimateFrameSamplesWithSilence(payloadBytes, modName, repetition, isFirstFrame) {
+    const coreSamples = estimateFrameSamples(payloadBytes, modName, repetition);
+    const isAcoustic = OFDM.CP_LEN >= 128;
+    const silencePre = isFirstFrame
+        ? Math.round(OFDM.SAMPLE_RATE * (isAcoustic ? 0.5 : 0.3))
+        : Math.round(OFDM.SAMPLE_RATE * 0.05);
+    const silencePost = Math.round(OFDM.SAMPLE_RATE * 0.02);
+    return silencePre + coreSamples + silencePost;
 }

@@ -55,6 +55,27 @@
 
         .info-box { background: rgba(0,212,255,0.08); border: 1px solid rgba(0,212,255,0.2); border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; font-size: 0.8rem; color: #aaa; line-height: 1.6; }
         .info-box strong { color: #00d4ff; }
+
+        #level-canvas, #waveform-canvas {
+            width: 100%; background: #0f0f23;
+            border-radius: 6px; border: 1px solid #2a2a4a;
+        }
+        #level-meter-container { margin-bottom: 12px; }
+        #waveform-container { margin-top: 12px; }
+        .trim-controls { display: flex; gap: 8px; margin: 8px 0; }
+        .trim-controls input[type="range"] { flex: 1; accent-color: #00d4ff; }
+        .trim-info { display: flex; justify-content: space-between; font-size: 0.8rem; color: #888; margin-bottom: 10px; }
+        #btn-demodulate { margin-top: 4px; }
+
+        .recv-mode-selector { display: flex; gap: 6px; margin-bottom: 12px; }
+        .recv-mode-btn { flex: 1; padding: 8px 12px; border: 1px solid #2a2a4a; border-radius: 8px; background: transparent; color: #888; cursor: pointer; font-size: 0.8rem; transition: all 0.2s; }
+        .recv-mode-btn:hover { border-color: #00d4ff; color: #ccc; }
+        .recv-mode-btn.active { border-color: #00d4ff; background: rgba(0,212,255,0.1); color: #00d4ff; }
+
+        #chunk-progress { margin-top: 12px; }
+        .chunk-stats { display: flex; justify-content: space-between; font-size: 0.8rem; color: #aaa; margin-bottom: 8px; }
+        #chunk-bitmap-canvas { width: 100%; height: 40px; background: #0f0f23; border-radius: 4px; border: 1px solid #2a2a4a; }
+        #chunk-filename { margin-top: 6px; font-size: 0.85rem; color: #00d4ff; }
     </style>
 </head>
 <body>
@@ -92,8 +113,20 @@
                         <option value="QPSK" selected>QPSK (~2.5 KB/s, 케이블)</option>
                         <option value="16-QAM">16-QAM (~5 KB/s, 케이블/고속)</option>
                         <option value="BPSK-ACOUSTIC">BPSK (~0.5 KB/s, 스피커→마이크)</option>
+                        <option value="BPSK-REPEAT">BPSK-반복 (~170 B/s, 고신뢰)</option>
+                        <option value="BPSK-NARROW">협대역 (~100 B/s, 최고 안정)</option>
                     </select>
                 </div>
+                <div class="setting-row" style="margin-top:10px">
+                    <label for="max-duration">최대 녹음</label>
+                    <select id="max-duration">
+                        <option value="120">2분 (~20MB RAM)</option>
+                        <option value="300">5분 (~50MB RAM)</option>
+                        <option value="600" selected>10분 (~100MB RAM)</option>
+                        <option value="1200">20분 (~200MB RAM)</option>
+                    </select>
+                </div>
+                <p id="modulation-info" style="margin-top:8px; font-size:0.8rem; color:#888; line-height:1.5"></p>
             </div>
 
             <div id="send-panel" class="card">
@@ -111,11 +144,54 @@
 
             <div id="receive-panel" class="card" style="display:none">
                 <h2>파일 수신 (마이크 입력)</h2>
-                <p style="color:#888; font-size:0.85rem; margin-bottom:12px">
+
+                <div class="recv-mode-selector">
+                    <button id="recv-mode-manual" class="recv-mode-btn active" onclick="setReceiveMode('manual')">수동 (트림)</button>
+                    <button id="recv-mode-streaming" class="recv-mode-btn" onclick="setReceiveMode('streaming')">스트리밍 (실시간)</button>
+                </div>
+
+                <div id="recv-manual-desc" style="color:#888; font-size:0.85rem; margin-bottom:12px">
                     수신 대기를 누르면 마이크 권한을 요청합니다.<br>
                     송신 완료 후 <strong>수신 중지</strong>를 눌러 복조하세요.
-                </p>
-                <button id="btn-receive" class="primary-btn" onclick="startReceive()">수신 대기</button>
+                </div>
+                <div id="recv-streaming-desc" style="color:#888; font-size:0.85rem; margin-bottom:12px; display:none">
+                    대용량 파일용 실시간 수신 모드입니다.<br>
+                    프레임을 자동 탐지하여 <strong>실시간으로 복조</strong>합니다.
+                </div>
+
+                <!-- 실시간 레벨미터 (녹음 중에만 표시) -->
+                <div id="level-meter-container" style="display:none">
+                    <canvas id="level-canvas" height="40"></canvas>
+                </div>
+
+                <button id="btn-receive" class="primary-btn" onclick="onReceiveClick()">수신 대기</button>
+
+                <!-- 청크 진행률 패널 (스트리밍 수신 시) -->
+                <div id="chunk-progress" style="display:none">
+                    <div class="chunk-stats">
+                        <span id="chunk-count">0 / 0 청크</span>
+                        <span id="chunk-errors">오류: 0</span>
+                        <span id="chunk-eta">남은 시간: --</span>
+                    </div>
+                    <canvas id="chunk-bitmap-canvas" height="40"></canvas>
+                    <p id="chunk-filename"></p>
+                </div>
+
+                <!-- 파형 트리머 (수동 모드, 녹음 완료 후 표시) -->
+                <div id="waveform-container" style="display:none">
+                    <canvas id="waveform-canvas" height="120"></canvas>
+                    <div class="trim-controls">
+                        <input type="range" id="trim-start" min="0" max="1000" value="0">
+                        <input type="range" id="trim-end" min="0" max="1000" value="1000">
+                    </div>
+                    <div class="trim-info">
+                        <span id="trim-start-label">0.0s</span>
+                        <span id="trim-duration-label"></span>
+                        <span id="trim-end-label">0.0s</span>
+                    </div>
+                    <button id="btn-demodulate" class="primary-btn" onclick="demodulateTrimed()">선택 구간 복조</button>
+                </div>
+
                 <div id="received-files"></div>
             </div>
 
