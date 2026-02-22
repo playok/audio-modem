@@ -304,7 +304,8 @@ async function readFileChunk(file, seqNum, chunkSize) {
 
 function playSignalAsync(ctx, signal) {
     return new Promise((resolve) => {
-        const buffer = ctx.createBuffer(1, signal.length, 44100);
+        const sr = ctx.sampleRate || 44100;
+        const buffer = ctx.createBuffer(1, signal.length, sr);
         buffer.getChannelData(0).set(signal);
         const source = ctx.createBufferSource();
         source.buffer = buffer;
@@ -1314,6 +1315,15 @@ function setTestButtonsDisabled(disabled) {
     document.querySelectorAll('.test-btn').forEach(btn => btn.disabled = disabled);
 }
 
+// --- Ensure AudioContext is running (critical for mobile) ---
+async function ensureAudioContext() {
+    const ctx = getAudioContext();
+    if (ctx.state === 'suspended') {
+        await ctx.resume();
+    }
+    return ctx;
+}
+
 // --- Output Test ---
 async function runOutputTest() {
     if (testRunning) return;
@@ -1324,12 +1334,14 @@ async function runOutputTest() {
     const { config, modName, repetition } = getModemParams(modulation);
     setOFDMConfig(config);
 
-    const ctx = getAudioContext();
     addLog('info', '출력 테스트 시작 — 스윕 톤 재생');
 
     try {
+        const ctx = await ensureAudioContext();
+        const sr = ctx.sampleRate;
+
         // 1. Sweep tone (1kHz → 10kHz, 2s)
-        const sweep = generateSweepTone(1000, 10000, 2.0, 44100);
+        const sweep = generateSweepTone(1000, 10000, 2.0, sr);
         await playSignalAsync(ctx, sweep);
         addLog('info', '스윕 톤 완료 — OFDM 테스트 심볼 재생');
 
@@ -1338,7 +1350,7 @@ async function runOutputTest() {
         await playSignalAsync(ctx, signal);
 
         addLog('success', '출력 테스트 완료 — 스피커/케이블에서 소리가 들렸다면 정상입니다');
-        showTestResult('출력 테스트 완료', '스피커 또는 케이블에서 스윕 톤과 OFDM 신호가 정상적으로 재생되었습니다.', 'good');
+        showTestResult('출력 테스트 완료', `스피커 또는 케이블에서 스윕 톤과 OFDM 신호가 정상적으로 재생되었습니다.\n(샘플레이트: ${sr} Hz)`, 'good');
     } catch (err) {
         addLog('error', `출력 테스트 오류: ${err.message}`);
     }
@@ -1363,7 +1375,6 @@ async function runInputTest() {
                 echoCancellation: false,
                 noiseSuppression: false,
                 autoGainControl: false,
-                sampleRate: 44100,
             }
         });
     } catch (err) {
@@ -1373,98 +1384,122 @@ async function runInputTest() {
         return;
     }
 
-    const ctx = getAudioContext();
-    const source = ctx.createMediaStreamSource(stream);
-    const processor = ctx.createScriptProcessor(4096, 1, 1);
-    const chunks = [];
-    let totalSamples = 0;
-    const maxSamples = 3 * 44100;
+    try {
+        const ctx = await ensureAudioContext();
+        const sr = ctx.sampleRate;
+        const source = ctx.createMediaStreamSource(stream);
+        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        const chunks = [];
+        let totalSamples = 0;
+        const maxSamples = 3 * sr;
 
-    await new Promise((resolve) => {
-        processor.onaudioprocess = (e) => {
-            const input = e.inputBuffer.getChannelData(0);
-            chunks.push(new Float32Array(input));
-            totalSamples += input.length;
-            if (totalSamples >= maxSamples) resolve();
-        };
-        source.connect(processor);
-        processor.connect(ctx.destination);
-    });
+        await new Promise((resolve) => {
+            // Timeout safety: resolve after 5s even if not enough samples
+            const timeout = setTimeout(() => {
+                addLog('warn', '녹음 타임아웃 — 수집된 데이터로 분석합니다');
+                resolve();
+            }, 5000);
 
-    processor.disconnect();
-    source.disconnect();
-    stream.getTracks().forEach(t => t.stop());
+            processor.onaudioprocess = (e) => {
+                const input = e.inputBuffer.getChannelData(0);
+                chunks.push(new Float32Array(input));
+                totalSamples += input.length;
+                if (totalSamples >= maxSamples) {
+                    clearTimeout(timeout);
+                    resolve();
+                }
+            };
+            source.connect(processor);
+            processor.connect(ctx.destination);
+        });
 
-    // Concatenate
-    const recorded = new Float32Array(totalSamples);
-    let off = 0;
-    for (const c of chunks) { recorded.set(c, off); off += c.length; }
+        processor.disconnect();
+        source.disconnect();
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
 
-    // Analyze
-    let sumSq = 0, peak = 0;
-    for (let i = 0; i < recorded.length; i++) {
-        const v = Math.abs(recorded[i]);
-        sumSq += recorded[i] * recorded[i];
-        if (v > peak) peak = v;
-    }
-    const rms = Math.sqrt(sumSq / recorded.length);
-    const rmsDb = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
-    const peakDb = peak > 0 ? 20 * Math.log10(peak) : -Infinity;
-
-    // Noise floor: average RMS of bottom 10% blocks
-    const blockSize = 1024;
-    const numBlocks = Math.floor(recorded.length / blockSize);
-    const blockRms = [];
-    for (let b = 0; b < numBlocks; b++) {
-        let bSum = 0;
-        for (let i = 0; i < blockSize; i++) {
-            const v = recorded[b * blockSize + i];
-            bSum += v * v;
+        if (totalSamples === 0) {
+            addLog('error', '녹음된 데이터가 없습니다. 마이크 권한을 확인하세요.');
+            testRunning = false;
+            setTestButtonsDisabled(false);
+            return;
         }
-        blockRms.push(Math.sqrt(bSum / blockSize));
+
+        // Concatenate
+        const recorded = new Float32Array(totalSamples);
+        let off = 0;
+        for (const c of chunks) { recorded.set(c, off); off += c.length; }
+
+        // Analyze
+        let sumSq = 0, peak = 0;
+        for (let i = 0; i < recorded.length; i++) {
+            const v = Math.abs(recorded[i]);
+            sumSq += recorded[i] * recorded[i];
+            if (v > peak) peak = v;
+        }
+        const rms = Math.sqrt(sumSq / recorded.length);
+        const rmsDb = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+        const peakDb = peak > 0 ? 20 * Math.log10(peak) : -Infinity;
+
+        // Noise floor: average RMS of bottom 10% blocks
+        const blockSize = 1024;
+        const numBlocks = Math.floor(recorded.length / blockSize);
+        const blockRms = [];
+        for (let b = 0; b < numBlocks; b++) {
+            let bSum = 0;
+            for (let i = 0; i < blockSize; i++) {
+                const v = recorded[b * blockSize + i];
+                bSum += v * v;
+            }
+            blockRms.push(Math.sqrt(bSum / blockSize));
+        }
+        blockRms.sort((a, b) => a - b);
+        const bottom10 = blockRms.slice(0, Math.max(1, Math.floor(numBlocks * 0.1)));
+        const noiseFloor = bottom10.reduce((s, v) => s + v, 0) / bottom10.length;
+        const noiseDb = noiseFloor > 0 ? 20 * Math.log10(noiseFloor) : -Infinity;
+
+        // FFT spectrum
+        const fftSize = 2048;
+        const specLen = Math.min(recorded.length, fftSize);
+        const fftRe = new Float64Array(fftSize);
+        const fftIm = new Float64Array(fftSize);
+        const midStart = Math.max(0, Math.floor((recorded.length - fftSize) / 2));
+        for (let i = 0; i < specLen; i++) fftRe[i] = recorded[midStart + i];
+        const [specRe, specIm] = fft(fftRe, fftIm);
+
+        const magnitudes = new Float32Array(fftSize / 2);
+        for (let i = 0; i < fftSize / 2; i++) {
+            magnitudes[i] = Math.sqrt(specRe[i] * specRe[i] + specIm[i] * specIm[i]);
+        }
+
+        // Draw spectrum
+        const canvas = document.getElementById('test-spectrum-canvas');
+        canvas.style.display = 'block';
+        drawSpectrum(canvas, magnitudes);
+
+        // Assessment
+        const clipping = peak > 0.95;
+        const lowLevel = rms < 0.005;
+        let quality, message;
+        if (clipping) {
+            quality = 'poor';
+            message = `클리핑 감지! 볼륨을 낮춰주세요.\nRMS: ${rmsDb.toFixed(1)} dB · 피크: ${peakDb.toFixed(1)} dB · 노이즈: ${noiseDb.toFixed(1)} dB`;
+        } else if (lowLevel) {
+            quality = 'poor';
+            message = `입력 레벨이 너무 낮습니다. 볼륨을 높이거나 마이크를 확인하세요.\nRMS: ${rmsDb.toFixed(1)} dB · 피크: ${peakDb.toFixed(1)} dB · 노이즈: ${noiseDb.toFixed(1)} dB`;
+        } else {
+            quality = rms > 0.02 ? 'excellent' : 'good';
+            message = `입력 감도 양호\nRMS: ${rmsDb.toFixed(1)} dB · 피크: ${peakDb.toFixed(1)} dB · 노이즈: ${noiseDb.toFixed(1)} dB`;
+        }
+        message += `\n(샘플레이트: ${sr} Hz, 녹음: ${(totalSamples / sr).toFixed(1)}초)`;
+
+        addLog(quality === 'poor' ? 'warn' : 'success', `입력 테스트: RMS=${rmsDb.toFixed(1)}dB, 피크=${peakDb.toFixed(1)}dB`);
+        showTestResult('입력 테스트 결과', message, quality);
+    } catch (err) {
+        addLog('error', `입력 테스트 오류: ${err.message}`);
+    } finally {
+        if (stream) stream.getTracks().forEach(t => t.stop());
     }
-    blockRms.sort((a, b) => a - b);
-    const bottom10 = blockRms.slice(0, Math.max(1, Math.floor(numBlocks * 0.1)));
-    const noiseFloor = bottom10.reduce((s, v) => s + v, 0) / bottom10.length;
-    const noiseDb = noiseFloor > 0 ? 20 * Math.log10(noiseFloor) : -Infinity;
-
-    // FFT spectrum
-    const fftSize = 2048;
-    const specLen = Math.min(recorded.length, fftSize);
-    const fftRe = new Float64Array(fftSize);
-    const fftIm = new Float64Array(fftSize);
-    // Use middle portion of recording
-    const midStart = Math.max(0, Math.floor((recorded.length - fftSize) / 2));
-    for (let i = 0; i < specLen; i++) fftRe[i] = recorded[midStart + i];
-    const [specRe, specIm] = fft(fftRe, fftIm);
-
-    const magnitudes = new Float32Array(fftSize / 2);
-    for (let i = 0; i < fftSize / 2; i++) {
-        magnitudes[i] = Math.sqrt(specRe[i] * specRe[i] + specIm[i] * specIm[i]);
-    }
-
-    // Draw spectrum
-    const canvas = document.getElementById('test-spectrum-canvas');
-    canvas.style.display = 'block';
-    drawSpectrum(canvas, magnitudes);
-
-    // Assessment
-    const clipping = peak > 0.95;
-    const lowLevel = rms < 0.005;
-    let quality, message;
-    if (clipping) {
-        quality = 'poor';
-        message = `클리핑 감지! 볼륨을 낮춰주세요.\nRMS: ${rmsDb.toFixed(1)} dB · 피크: ${peakDb.toFixed(1)} dB · 노이즈: ${noiseDb.toFixed(1)} dB`;
-    } else if (lowLevel) {
-        quality = 'poor';
-        message = `입력 레벨이 너무 낮습니다. 볼륨을 높이거나 마이크를 확인하세요.\nRMS: ${rmsDb.toFixed(1)} dB · 피크: ${peakDb.toFixed(1)} dB · 노이즈: ${noiseDb.toFixed(1)} dB`;
-    } else {
-        quality = rms > 0.02 ? 'excellent' : 'good';
-        message = `입력 감도 양호\nRMS: ${rmsDb.toFixed(1)} dB · 피크: ${peakDb.toFixed(1)} dB · 노이즈: ${noiseDb.toFixed(1)} dB`;
-    }
-
-    addLog(quality === 'poor' ? 'warn' : 'success', `입력 테스트: RMS=${rmsDb.toFixed(1)}dB, 피크=${peakDb.toFixed(1)}dB`);
-    showTestResult('입력 테스트 결과', message, quality);
 
     testRunning = false;
     setTestButtonsDisabled(false);
@@ -1489,7 +1524,6 @@ async function runLoopbackTest() {
                 echoCancellation: false,
                 noiseSuppression: false,
                 autoGainControl: false,
-                sampleRate: 44100,
             }
         });
     } catch (err) {
@@ -1499,75 +1533,94 @@ async function runLoopbackTest() {
         return;
     }
 
-    const ctx = getAudioContext();
-    const source = ctx.createMediaStreamSource(stream);
-    const processor = ctx.createScriptProcessor(4096, 1, 1);
-    const chunks = [];
-    let totalSamples = 0;
-    let recording = true;
+    try {
+        const ctx = await ensureAudioContext();
+        const sr = ctx.sampleRate;
+        const source = ctx.createMediaStreamSource(stream);
+        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        const chunks = [];
+        let totalSamples = 0;
+        let recording = true;
 
-    processor.onaudioprocess = (e) => {
-        if (!recording) return;
-        const input = e.inputBuffer.getChannelData(0);
-        chunks.push(new Float32Array(input));
-        totalSamples += input.length;
-    };
-    source.connect(processor);
-    processor.connect(ctx.destination);
+        processor.onaudioprocess = (e) => {
+            if (!recording) return;
+            const input = e.inputBuffer.getChannelData(0);
+            chunks.push(new Float32Array(input));
+            totalSamples += input.length;
+        };
+        source.connect(processor);
+        processor.connect(ctx.destination);
 
-    // Generate and play test signal
-    const { signal: testSignal, testData } = generateTestSignal(modName, repetition);
-    await playSignalAsync(ctx, testSignal);
+        // Wait briefly to ensure processor is running before playback
+        await sleep(200);
 
-    // Wait 1 second after playback
-    await sleep(1000);
+        // Generate and play test signal
+        const { signal: testSignal, testData } = generateTestSignal(modName, repetition);
+        await playSignalAsync(ctx, testSignal);
 
-    // Stop recording
-    recording = false;
-    processor.disconnect();
-    source.disconnect();
-    stream.getTracks().forEach(t => t.stop());
+        // Wait 1 second after playback
+        await sleep(1000);
 
-    // Concatenate
-    const recorded = new Float32Array(totalSamples);
-    let off = 0;
-    for (const c of chunks) { recorded.set(c, off); off += c.length; }
+        // Stop recording
+        recording = false;
+        processor.disconnect();
+        source.disconnect();
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
 
-    addLog('info', `녹음 완료: ${(totalSamples / 44100).toFixed(1)}초 — 분석 중...`);
+        if (totalSamples === 0) {
+            addLog('error', '녹음된 데이터가 없습니다. 마이크를 확인하세요.');
+            testRunning = false;
+            setTestButtonsDisabled(false);
+            return;
+        }
 
-    // Analyze
-    const result = analyzeLoopback(recorded, modName, repetition, testData);
+        // Concatenate
+        const recorded = new Float32Array(totalSamples);
+        let off = 0;
+        for (const c of chunks) { recorded.set(c, off); off += c.length; }
 
-    // Draw channel response if available
-    if (result.channelMagnitude.length > 0) {
-        const canvas = document.getElementById('test-channel-canvas');
-        canvas.style.display = 'block';
-        drawChannelResponse(canvas, result.channelMagnitude);
+        addLog('info', `녹음 완료: ${(totalSamples / sr).toFixed(1)}초 — 분석 중...`);
+
+        // Analyze
+        const result = analyzeLoopback(recorded, modName, repetition, testData);
+
+        // Draw channel response if available
+        if (result.channelMagnitude.length > 0) {
+            const canvas = document.getElementById('test-channel-canvas');
+            canvas.style.display = 'block';
+            drawChannelResponse(canvas, result.channelMagnitude);
+        }
+
+        // Build result message
+        const corrPct = (result.correlation * 100).toFixed(1);
+        const berPct = (result.ber * 100).toFixed(1);
+        let recommendedMod = '';
+        if (result.quality === 'excellent') {
+            recommendedMod = '16-QAM 또는 QPSK 사용 가능';
+        } else if (result.quality === 'good') {
+            recommendedMod = 'QPSK 또는 BPSK-ACOUSTIC 권장';
+        } else {
+            recommendedMod = 'BPSK-반복 또는 협대역 권장';
+        }
+
+        const message = [
+            `프리앰블 탐지: ${result.detected ? '성공' : '실패'}`,
+            `상관 피크: ${corrPct}%`,
+            `BER: ${berPct}%`,
+            `SNR 추정: ${isFinite(result.snrEstimate) ? result.snrEstimate.toFixed(1) + ' dB' : 'N/A'}`,
+            `권장 변조: ${recommendedMod}`,
+            `(샘플레이트: ${sr} Hz)`,
+        ].join('\n');
+
+        addLog(result.quality === 'poor' ? 'warn' : 'success',
+            `루프백 테스트: 상관=${corrPct}%, BER=${berPct}%, 품질=${result.quality}`);
+        showTestResult('루프백 테스트 결과', message, result.quality);
+    } catch (err) {
+        addLog('error', `루프백 테스트 오류: ${err.message}`);
+    } finally {
+        if (stream) stream.getTracks().forEach(t => t.stop());
     }
-
-    // Build result message
-    const corrPct = (result.correlation * 100).toFixed(1);
-    const berPct = (result.ber * 100).toFixed(1);
-    let recommendedMod = '';
-    if (result.quality === 'excellent') {
-        recommendedMod = '16-QAM 또는 QPSK 사용 가능';
-    } else if (result.quality === 'good') {
-        recommendedMod = 'QPSK 또는 BPSK-ACOUSTIC 권장';
-    } else {
-        recommendedMod = 'BPSK-반복 또는 협대역 권장';
-    }
-
-    const message = [
-        `프리앰블 탐지: ${result.detected ? '성공' : '실패'}`,
-        `상관 피크: ${corrPct}%`,
-        `BER: ${berPct}%`,
-        `SNR 추정: ${isFinite(result.snrEstimate) ? result.snrEstimate.toFixed(1) + ' dB' : 'N/A'}`,
-        `권장 변조: ${recommendedMod}`,
-    ].join('\n');
-
-    addLog(result.quality === 'poor' ? 'warn' : 'success',
-        `루프백 테스트: 상관=${corrPct}%, BER=${berPct}%, 품질=${result.quality}`);
-    showTestResult('루프백 테스트 결과', message, result.quality);
 
     testRunning = false;
     setTestButtonsDisabled(false);
