@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Modem - File Transfer</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Audio Modem</h1>
+            <p class="subtitle">3.5mm AUX 케이블을 통한 파일 전송</p>
+            <div id="connection-status" class="status disconnected">
+                <span class="status-dot"></span>
+                <span id="status-text">연결 대기</span>
+            </div>
+        </header>
+
+        <main>
+            <!-- Mode Selection -->
+            <div class="card">
+                <h2>전송 모드</h2>
+                <div class="mode-selector">
+                    <button id="btn-send-mode" class="mode-btn active" onclick="setMode('send')">
+                        <span class="icon">📤</span>
+                        <span>파일 전송</span>
+                    </button>
+                    <button id="btn-recv-mode" class="mode-btn" onclick="setMode('receive')">
+                        <span class="icon">📥</span>
+                        <span>파일 수신</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Settings -->
+            <div class="card">
+                <h2>설정</h2>
+                <div class="setting-row">
+                    <label for="modulation">변조 방식</label>
+                    <select id="modulation">
+                        <option value="QPSK">QPSK (~2.5 KB/s, 안전)</option>
+                        <option value="16-QAM" selected>16-QAM (~5.1 KB/s, 기본)</option>
+                        <option value="64-QAM">64-QAM (~7.7 KB/s, 고속)</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Send Panel -->
+            <div id="send-panel" class="card">
+                <h2>파일 전송</h2>
+                <div class="upload-area" id="upload-area">
+                    <input type="file" id="file-input" onchange="handleFileSelect(event)">
+                    <div class="upload-content">
+                        <span class="upload-icon">📁</span>
+                        <p>파일을 선택하거나 드래그하세요</p>
+                        <p id="file-info" class="file-info"></p>
+                    </div>
+                </div>
+                <button id="btn-send" class="primary-btn" onclick="startSend()" disabled>
+                    전송 시작
+                </button>
+            </div>
+
+            <!-- Receive Panel -->
+            <div id="receive-panel" class="card" style="display:none">
+                <h2>파일 수신</h2>
+                <p>AUX 케이블을 연결하고 수신 대기를 시작하세요.</p>
+                <button id="btn-receive" class="primary-btn" onclick="startReceive()">
+                    수신 대기
+                </button>
+                <div id="received-files" class="file-list"></div>
+            </div>
+
+            <!-- Progress -->
+            <div id="progress-panel" class="card" style="display:none">
+                <h2>전송 진행</h2>
+                <div class="progress-bar">
+                    <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+                </div>
+                <div class="progress-info">
+                    <span id="progress-percent">0%</span>
+                    <span id="progress-bytes"></span>
+                </div>
+                <p id="progress-message" class="progress-message"></p>
+            </div>
+
+            <!-- Log -->
+            <div class="card">
+                <h2>로그</h2>
+                <div id="log-container" class="log-container">
+                    <div class="log-entry info">시스템 준비 완료</div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
