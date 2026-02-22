@@ -18,6 +18,12 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 });
 
+function getModemParams(mod) {
+    if (mod === 'BPSK-ACOUSTIC') return { config: 'acoustic', modName: 'BPSK' };
+    if (mod === '16-QAM') return { config: 'standard', modName: 'QAM16' };
+    return { config: 'standard', modName: 'QPSK' };
+}
+
 function getAudioContext() {
     if (!audioCtx || audioCtx.state === 'closed') {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
@@ -64,7 +70,8 @@ async function startSend() {
 
         // Build signal (run in next frame to update UI)
         await sleep(50);
-        const modName = modulation === '16-QAM' ? 'QAM16' : 'QPSK';
+        const { config, modName } = getModemParams(modulation);
+        setOFDMConfig(config);
         const result = buildTransmitSignal(fileData, modName, selectedFileName);
 
         const duration = result.signal.length / 44100;
@@ -201,7 +208,8 @@ function stopReceive() {
     // Decode
     setTimeout(() => {
         try {
-            const modName = modulation === '16-QAM' ? 'QAM16' : 'QPSK';
+            const { config, modName } = getModemParams(modulation);
+            setOFDMConfig(config);
             const result = decodeReceivedSignal(signal, modName);
 
             if (result.error) {

@@ -66,16 +66,20 @@ function revBits(x, bits) {
 }
 
 // --- OFDM Parameters ---
-const OFDM = {
-    FFT_SIZE: 512,
-    CP_LEN: 64,
-    SYMBOL_LEN: 576,
-    SAMPLE_RATE: 44100,
-    SUB_START: 12,
-    SUB_END: 232,
-    PILOTS: [15, 29, 43, 57, 71, 85, 99, 113, 127, 141, 155, 169, 183, 197, 211, 225],
+const OFDM_CONFIGS = {
+    standard: {
+        FFT_SIZE: 512, CP_LEN: 64, SYMBOL_LEN: 576, SAMPLE_RATE: 44100,
+        SUB_START: 12, SUB_END: 232,
+        PILOTS: [15, 29, 43, 57, 71, 85, 99, 113, 127, 141, 155, 169, 183, 197, 211, 225],
+    },
+    acoustic: {
+        FFT_SIZE: 512, CP_LEN: 128, SYMBOL_LEN: 640, SAMPLE_RATE: 44100,
+        SUB_START: 23, SUB_END: 93,   // ~2000Hz–8000Hz (스피커/마이크 안정 대역)
+        PILOTS: [25, 35, 45, 55, 65, 75, 85],
+    },
 };
 
+const OFDM = { ...OFDM_CONFIGS.standard };
 OFDM.isPilot = (k) => OFDM.PILOTS.includes(k);
 OFDM.numDataSubs = () => {
     let c = 0;
@@ -83,8 +87,14 @@ OFDM.numDataSubs = () => {
     return c;
 };
 
+function setOFDMConfig(name) {
+    const cfg = OFDM_CONFIGS[name] || OFDM_CONFIGS.standard;
+    Object.keys(cfg).forEach(k => { OFDM[k] = cfg[k]; });
+}
+
 // --- Constellation ---
 const Constellations = {
+    BPSK: { bps: 1, points: null },
     QPSK: { bps: 2, points: null },
     QAM16: { bps: 4, points: null },
 };
@@ -92,7 +102,9 @@ const Constellations = {
 function initConstellation(name) {
     const c = Constellations[name];
     if (c.points) return c;
-    if (name === 'QPSK') {
+    if (name === 'BPSK') {
+        c.points = [[1, 0], [-1, 0]];
+    } else if (name === 'QPSK') {
         const s = 1 / Math.SQRT2;
         c.points = [
             [s, s], [-s, s], [-s, -s], [s, -s]
@@ -190,36 +202,115 @@ function addCP(td) {
     return out;
 }
 
-// --- Preamble Detection (Sliding Window, O(n)) ---
+// --- Signal Preprocessing (DC removal + normalize only) ---
+// Note: bandpass filtering omitted because it distorts cross-correlation.
+// The OFDM channel equalizer handles frequency response naturally.
+function preprocessSignal(signal) {
+    // 1. DC removal
+    let mean = 0;
+    for (let i = 0; i < signal.length; i++) mean += signal[i];
+    mean /= signal.length;
+
+    const out = new Float32Array(signal.length);
+    let mx = 0;
+    for (let i = 0; i < signal.length; i++) {
+        out[i] = signal[i] - mean;
+        mx = Math.max(mx, Math.abs(out[i]));
+    }
+
+    // 2. Normalize to unit peak
+    if (mx > 1e-6) {
+        for (let i = 0; i < out.length; i++) out[i] /= mx;
+    }
+
+    return out;
+}
+
+// --- Preamble Detection: Cross-Correlation (robust for acoustic) ---
+function detectPreambleCrossCorr(signal) {
+    const pre1 = generatePreambleSymbol1();
+    const pLen = pre1.length;
+    if (signal.length < pLen) return -1;
+
+    // Template energy
+    let tEnergy = 0;
+    for (let i = 0; i < pLen; i++) tEnergy += pre1[i] * pre1[i];
+    if (tEnergy < 1e-10) return -1;
+
+    const end = signal.length - pLen;
+    const step = Math.max(1, Math.floor(pLen / 10));
+
+    // Coarse search
+    let best = 0, bestIdx = -1;
+    for (let d = 0; d <= end; d += step) {
+        let corr = 0, sEnergy = 0;
+        for (let i = 0; i < pLen; i++) {
+            corr += signal[d + i] * pre1[i];
+            sEnergy += signal[d + i] * signal[d + i];
+        }
+        const denom = Math.sqrt(sEnergy * tEnergy);
+        if (denom > 0.001) {
+            const metric = corr / denom;
+            if (metric > best) { best = metric; bestIdx = d; }
+        }
+    }
+
+    if (bestIdx < 0 || best < 0.15) return -1;
+
+    // Fine search around coarse peak
+    const fineStart = Math.max(0, bestIdx - step);
+    const fineEnd = Math.min(end, bestIdx + step);
+    best = 0;
+    for (let d = fineStart; d <= fineEnd; d++) {
+        let corr = 0, sEnergy = 0;
+        for (let i = 0; i < pLen; i++) {
+            corr += signal[d + i] * pre1[i];
+            sEnergy += signal[d + i] * signal[d + i];
+        }
+        const denom = Math.sqrt(sEnergy * tEnergy);
+        if (denom > 0.001) {
+            const metric = corr / denom;
+            if (metric > best) { best = metric; bestIdx = d; }
+        }
+    }
+
+    return best > 0.15 ? bestIdx : -1;
+}
+
+// --- Preamble Detection: Auto-Correlation (Sliding Window, O(n)) ---
 function detectPreamble(signal) {
     const half = OFDM.FFT_SIZE / 2; // 256
     const len = signal.length;
     if (len < 2 * half) return -1;
 
-    // Compute initial P(0) and R(0)
-    let p = 0, r = 0;
+    // Compute initial P(0), Ra(0), Rb(0)
+    let p = 0, ra = 0, rb = 0;
     for (let m = 0; m < half; m++) {
-        p += signal[m] * signal[m + half];
-        r += signal[m + half] * signal[m + half];
+        const a = signal[m], b = signal[m + half];
+        p += a * b;
+        ra += a * a;
+        rb += b * b;
     }
 
     let best = 0, bestIdx = -1;
     const end = len - 2 * half;
+    const minEnergy = 0.01;
 
     for (let d = 0; d <= end; d++) {
-        if (r > 1e-6) {
-            const metric = (p * p) / (r * r);
+        // Normalized metric: p² / (ra * rb) ∈ [0, 1] (Pearson r²)
+        if (ra > minEnergy && rb > minEnergy) {
+            const metric = (p * p) / (ra * rb);
             if (metric > best) { best = metric; bestIdx = d; }
         }
         if (d < end) {
-            const mid = d + half;
-            const enter = d + 2 * half;
-            p += signal[mid] * signal[enter] - signal[d] * signal[mid];
-            r += signal[enter] * signal[enter] - signal[mid] * signal[mid];
+            const aOut = signal[d], mid = signal[d + half], bIn = signal[d + 2 * half];
+            p  += mid * bIn  - aOut * mid;
+            ra += mid * mid  - aOut * aOut;
+            rb += bIn * bIn  - mid  * mid;
         }
     }
 
-    return best > 0.3 ? bestIdx : -1;
+    return best > 0.5 ? bestIdx : -1;
 }
 
 // --- Modulation ---
@@ -413,8 +504,9 @@ function buildTransmitSignal(fileData, modName, fileName) {
     const pre2 = generatePreambleSymbol2();
     const ce = generateChannelEstSymbol();
 
-    const silencePre = new Float32Array(OFDM.SAMPLE_RATE * 0.3);
-    const silencePost = new Float32Array(OFDM.SAMPLE_RATE * 0.2);
+    const isAcoustic = OFDM.CP_LEN >= 128;
+    const silencePre = new Float32Array(OFDM.SAMPLE_RATE * (isAcoustic ? 0.5 : 0.3));
+    const silencePost = new Float32Array(OFDM.SAMPLE_RATE * (isAcoustic ? 0.5 : 0.2));
 
     let totalLen = silencePre.length + pre1.length + pre2.length + ce.samples.length + silencePost.length;
     for (const s of samples) totalLen += s.length;
@@ -437,9 +529,36 @@ function buildTransmitSignal(fileData, modName, fileName) {
 }
 
 function decodeReceivedSignal(signal, modName) {
-    // Detect preamble
-    const startIdx = detectPreamble(signal);
-    if (startIdx < 0) return { error: 'Preamble not detected' };
+    // Preprocess: DC removal + normalize
+    signal = preprocessSignal(signal);
+
+    // Step 1: Coarse preamble detection (Schmidl-Cox auto-correlation, O(n))
+    let coarseIdx = detectPreamble(signal);
+    if (coarseIdx < 0) return { error: 'Preamble not detected' };
+
+    // Step 2: Fine-tune with cross-correlation around coarse estimate
+    const pre1 = generatePreambleSymbol1();
+    let tEnergy = 0;
+    for (let i = 0; i < pre1.length; i++) tEnergy += pre1[i] * pre1[i];
+
+    const searchRadius = OFDM.CP_LEN * 3;
+    const fineStart = Math.max(0, coarseIdx - searchRadius);
+    const fineEnd = Math.min(signal.length - pre1.length, coarseIdx + searchRadius);
+
+    let bestMetric = -Infinity, startIdx = coarseIdx;
+    for (let d = fineStart; d <= fineEnd; d++) {
+        let corr = 0, sEnergy = 0;
+        for (let i = 0; i < pre1.length; i++) {
+            corr += signal[d + i] * pre1[i];
+            sEnergy += signal[d + i] * signal[d + i];
+        }
+        const denom = Math.sqrt(sEnergy * tEnergy);
+        if (denom > 0.001) {
+            const metric = corr / denom;
+            if (metric > bestMetric) { bestMetric = metric; startIdx = d; }
+        }
+    }
+    if (bestMetric < 0.1) return { error: 'Preamble not detected (low correlation)' };
 
     // Channel estimation
     const ceStart = startIdx + 2 * OFDM.SYMBOL_LEN;
